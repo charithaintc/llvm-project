@@ -64,7 +64,8 @@ static bool isWriteHintOrNone(const CachePolicyAttr &attr) {
     return true;
   auto kind = attr.getValue();
   return kind == CachePolicy::CACHED || kind == CachePolicy::UNCACHED ||
-         kind == CachePolicy::WRITE_BACK || kind == CachePolicy::WRITE_THROUGH;
+         kind == CachePolicy::STREAMING || kind == CachePolicy::WRITE_BACK ||
+         kind == CachePolicy::WRITE_THROUGH;
 }
 
 static LogicalResult
@@ -303,7 +304,7 @@ LogicalResult LoadNdOp::verify() {
       mlir::emitWarning(getLoc()) << "Invalid transpose attr. It is ignored.";
   }
 
-  if (getPacked()) {
+  if (getPacked() || getTransposeBitWidth() == 32) {
     if (tdescTy.getRank() == 2) {
       const int axis = 0;
       auto vnni_factor = valueShape.back();

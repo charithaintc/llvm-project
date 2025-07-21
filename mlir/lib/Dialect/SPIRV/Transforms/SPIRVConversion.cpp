@@ -87,9 +87,13 @@ static std::optional<SmallVector<int64_t>> getTargetShape(VectorType vecType) {
 template <typename LabelT>
 static LogicalResult checkExtensionRequirements(
     LabelT label, const spirv::TargetEnv &targetEnv,
-    const spirv::SPIRVType::ExtensionArrayRefVector &candidates) {
+    const spirv::SPIRVType::ExtensionArrayRefVector &candidates,
+    const ArrayRef<spirv::Extension> &elidedCandidates = {}) {
   for (const auto &ors : candidates) {
-    if (targetEnv.allows(ors))
+    if (targetEnv.allows(ors) ||
+        llvm::any_of(elidedCandidates, [&](spirv::Extension elidedExt) {
+          return llvm::is_contained(ors, elidedExt);
+        }))
       continue;
 
     LLVM_DEBUG({
@@ -115,9 +119,13 @@ static LogicalResult checkExtensionRequirements(
 template <typename LabelT>
 static LogicalResult checkCapabilityRequirements(
     LabelT label, const spirv::TargetEnv &targetEnv,
-    const spirv::SPIRVType::CapabilityArrayRefVector &candidates) {
+    const spirv::SPIRVType::CapabilityArrayRefVector &candidates,
+    const ArrayRef<spirv::Capability> &elidedCandidates = {}) {
   for (const auto &ors : candidates) {
-    if (targetEnv.allows(ors))
+    if (targetEnv.allows(ors) ||
+        llvm::any_of(elidedCandidates, [&](spirv::Capability elidedCap) {
+          return llvm::is_contained(ors, elidedCap);
+        }))
       continue;
 
     LLVM_DEBUG({
@@ -131,6 +139,55 @@ static LogicalResult checkCapabilityRequirements(
     });
     return failure();
   }
+  return success();
+}
+
+/// Check capabilities and extensions requirements,
+/// this function also checks for capability infered extension requirements,
+/// the check is based on capabilities that are passed to the targetEnv.
+///
+/// It Also provides a way to relax requirements for certain capabilities and
+/// extensions (e.g., elidedCapCandidates, elidedExtCandidates), this is to
+/// allow passes to relax certain requirements based on an option (e.g.,
+/// relaxing bitwidth requirement, see convertScalarType(), ConvertVectorType())
+template <typename LabelT>
+static LogicalResult checkCapabilityAndExtensionRequirements(
+    LabelT label, const spirv::TargetEnv &targetEnv,
+    const spirv::SPIRVType::CapabilityArrayRefVector &capCandidates,
+    const spirv::SPIRVType::ExtensionArrayRefVector &extCandidates,
+    const ArrayRef<spirv::Capability> &elidedCapCandidates = {},
+    const ArrayRef<spirv::Extension> &elidedExtCandidates = {}) {
+  llvm::SmallVector<::llvm::ArrayRef<::mlir::spirv::Extension>, 8>
+      updatedExtCandidates;
+  llvm::copy(extCandidates, updatedExtCandidates.begin());
+  if (failed(checkCapabilityRequirements(label, targetEnv, capCandidates,
+                                         elidedCapCandidates)))
+    return failure();
+  // Add capablity infered extensions to the list of extension requirement list,
+  // only considers the capabilities that already available in the targetEnv
+
+  // @FIXME: Some capabilities are part of both the core SPIR-V specification
+  // and an extension (e.g., 'Groups' capability is part of both core
+  // specification and SPV_AMD_shader_ballot extension, hence we should relax
+  // the capability inferred extension for this cases)
+  static const ::mlir::spirv::Capability multiModalCaps[] = {
+      ::mlir::spirv::Capability::Groups};
+  ArrayRef<::mlir::spirv::Capability> multiModalCapsArrayRef(
+      multiModalCaps, std::size(multiModalCaps));
+
+  for (auto cap : targetEnv.getAttr().getCapabilities()) {
+    if (llvm::any_of(
+            multiModalCapsArrayRef,
+            [&](::mlir::spirv::Capability mMCap) { return cap == mMCap; }))
+      continue;
+    std::optional<::llvm::ArrayRef<::mlir::spirv::Extension>> ext =
+        getExtensions(cap);
+    if (ext.has_value())
+      updatedExtCandidates.push_back(ext.value());
+  }
+  if (failed(checkExtensionRequirements(label, targetEnv, updatedExtCandidates,
+                                        elidedExtCandidates)))
+    return failure();
   return success();
 }
 
@@ -279,11 +336,14 @@ convertScalarType(const spirv::TargetEnv &targetEnv,
     return nullptr;
   }
 
+  //  Convert to 32-bit float and remove floatType related capability
+  //  restriction
   if (auto floatType = dyn_cast<FloatType>(type)) {
     LLVM_DEBUG(llvm::dbgs() << type << " converted to 32-bit for SPIR-V\n");
     return Builder(targetEnv.getContext()).getF32Type();
   }
 
+  //  Convert to 32-bit int and remove intType related capability restriction
   auto intType = cast<IntegerType>(type);
   LLVM_DEBUG(llvm::dbgs() << type << " converted to 32-bit for SPIR-V\n");
   return IntegerType::get(targetEnv.getContext(), /*width=*/32,
@@ -358,10 +418,13 @@ convertVectorType(const spirv::TargetEnv &targetEnv,
 
     if (type.getRank() <= 1 && type.getNumElements() == 1)
       return elementType;
-
-    if (type.getNumElements() > 4) {
-      LLVM_DEBUG(llvm::dbgs()
-                 << type << " illegal: > 4-element unimplemented\n");
+    // Number of elements should be between [2 to 2^32 - 1] for SPIR-V vector
+    // type.
+    if (type.getNumElements() < 2 &&
+        type.getNumElements() > std::numeric_limits<uint32_t>::max()) {
+      LLVM_DEBUG(llvm::dbgs() << type
+                              << " illegal: SPIR-V vector length has to be "
+                                 "between [2 - 2^32 -1]\n");
       return nullptr;
     }
 
@@ -383,16 +446,40 @@ convertVectorType(const spirv::TargetEnv &targetEnv,
   cast<spirv::CompositeType>(type).getExtensions(extensions, storageClass);
   cast<spirv::CompositeType>(type).getCapabilities(capabilities, storageClass);
 
-  // If all requirements are met, then we can accept this type as-is.
-  if (succeeded(checkCapabilityRequirements(type, targetEnv, capabilities)) &&
-      succeeded(checkExtensionRequirements(type, targetEnv, extensions)))
-    return type;
-
+  // If the bit-width related capabilities and extensions are not met
+  // for lower bit-width (<32-bit), convert it to 32-bit
   auto elementType =
       convertScalarType(targetEnv, options, scalarType, storageClass);
   if (elementType)
-    return VectorType::get(type.getShape(), elementType);
-  return nullptr;
+    type = VectorType::get(type.getShape(), elementType);
+  else
+    return nullptr;
+
+  llvm::SmallVector<spirv::Capability, 4> elidedCaps;
+  llvm::SmallVector<spirv::Extension, 4> elidedExts;
+
+  // Relax the bitwidth requirements for capabilities and extensions
+  if (options.emulateLT32BitScalarTypes) {
+    elidedCaps.push_back(spirv::Capability::Int8);
+    elidedCaps.push_back(spirv::Capability::Int16);
+    elidedCaps.push_back(spirv::Capability::Float16);
+  }
+  // For capabilities whose requirements were relaxed, relax requirements for
+  // the extensions that were infered by those capabilities (e.g., elidedCaps)
+  for (auto cap : elidedCaps) {
+    std::optional<::llvm::ArrayRef<::mlir::spirv::Extension>> ext =
+        mlir::spirv::getExtensions(cap);
+    if (ext.has_value())
+      elidedExts.insert(elidedExts.end(), ext.value().begin(),
+                        ext.value().end());
+  }
+  // If all requirements are met, then we can accept this type as-is.
+  if (succeeded(checkCapabilityAndExtensionRequirements(
+          type, targetEnv, capabilities, extensions, elidedCaps, elidedExts)))
+    return type;
+  else {
+    return nullptr;
+  }
 }
 
 static Type
@@ -1563,16 +1650,18 @@ bool SPIRVConversionTarget::isLegalOp(Operation *op) {
   SmallVector<ArrayRef<spirv::Extension>, 4> typeExtensions;
   SmallVector<ArrayRef<spirv::Capability>, 8> typeCapabilities;
   for (Type valueType : valueTypes) {
-    typeExtensions.clear();
-    cast<spirv::SPIRVType>(valueType).getExtensions(typeExtensions);
-    if (failed(checkExtensionRequirements(op->getName(), this->targetEnv,
-                                          typeExtensions)))
-      return false;
-
     typeCapabilities.clear();
     cast<spirv::SPIRVType>(valueType).getCapabilities(typeCapabilities);
-    if (failed(checkCapabilityRequirements(op->getName(), this->targetEnv,
-                                           typeCapabilities)))
+    typeExtensions.clear();
+    cast<spirv::SPIRVType>(valueType).getExtensions(typeExtensions);
+    // Checking for capability and extension requirements along with capability
+    // infered extensions
+    // If a capability is present, the extension that
+    // supports it should also be present, this reduces the burden of adding
+    // extension requirement that may or maynot be added in
+    // CompositeType::getExtensions()
+    if (failed(checkCapabilityAndExtensionRequirements(
+            op->getName(), this->targetEnv, typeCapabilities, typeExtensions)))
       return false;
   }
 
