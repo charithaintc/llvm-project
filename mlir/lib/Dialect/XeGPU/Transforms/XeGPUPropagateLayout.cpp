@@ -63,6 +63,7 @@ struct Layout {
   SmallVector<int64_t, 3> layout;
   Layout() = default;
   Layout(std::initializer_list<int64_t> list) : layout(list) {}
+  Layout(SmallVector<int64_t, 3> &list) : layout(list) {}
   void print(llvm::raw_ostream &os) const;
   size_t size() const { return layout.size(); }
   int64_t operator[](size_t idx) const;
@@ -541,34 +542,59 @@ void LayoutInfoPropagation::visitVectorBitcastOp(
     propagateIfChanged(operands[0], operands[0]->meet(resultLayout));
     return;
   }
-  // LaneLayout does not change.
-  const LaneLayout &newLaneLayout = resultLayout.getLayout();
-  const LaneData &currData = resultLayout.getData();
-  LaneData newLaneData;
+  int64_t rank = bitcast.getSourceVectorType().getRank();
   // Bitcast is a `narrowing` if the input element type bit width larger than
   // the output element type bit width. eg. f32 -> f16 is a narrowing bitcast.
   bool isNarrowing = inElemTyBitWidth > outElemTyBitWidth;
   int bitCastRatio = isNarrowing ? inElemTyBitWidth / outElemTyBitWidth
                                  : outElemTyBitWidth / inElemTyBitWidth;
-  // Bitcasts only impacts the inner most dimension of the vector (dimention at
-  // index 1 for 2D vectors). So we only need to adjust the inner dimension of
-  // lane_data based on whether it's a narrowing or widening bitcast.
-  // TODO: For narrowing bitcasts, if each lane does not own the required number
-  // of elements in the innermost dim to do the bitcast it requires cross lane
-  // communication. This case currently not supported. emit a warning and
-  // return.
-  if (isNarrowing &&
-      (currData[1] * outElemTyBitWidth) % inElemTyBitWidth != 0) {
+  const LaneLayout &sourceLaneLayout =
+      resultLayout.getLayout(); // source lane layout is unchanged.
+  ArrayRef<int64_t> currData = resultLayout.getDataAsArrayRef();
+
+  // TODO: Currently we assume that bitcasts does not require cross lane
+  // communication. So each lane must own the required number of elements to
+  // perform the bitcast locally without cross-lane communication.
+  // For 1D vectors, decide how many elements each lane owns based on whether
+  // the bitcast is narrowing or widening.
+  if (rank == 1) {
+    if ((currData[0] * outElemTyBitWidth) % inElemTyBitWidth != 0) {
+      bitcast.emitWarning(
+          "Narrowing bitcast with cross lane communication is not supported.");
+      return;
+    }
+    LaneData sourceLaneData = isNarrowing
+                                  ? LaneData({currData[0] / bitCastRatio})
+                                  : LaneData({currData[0] * bitCastRatio});
+
+    propagateIfChanged(operands[0], operands[0]->meet(LayoutInfo(
+                                        sourceLaneLayout, sourceLaneData)));
+  }
+  // For nD vectors, Each lane is not allowed to own multiple elements in any
+  // dimension other than the innermost dimension.
+  // TODO: Add support for other case depending on the use case.
+  SmallVector<int64_t, 3> sourceLaneDataStorage(currData.begin(),
+                                                currData.end() - 1);
+  if (llvm::any_of(sourceLaneDataStorage, [](int64_t d) { return d != 1; })) {
     bitcast.emitWarning(
-        "Widening bitcast with cross lane communication is not supported.");
+        "Each lane must not own multiple elements in any dimension other than "
+        "the innermost dimension.");
     return;
   }
-  // Compute the new lane_data.
-  newLaneData = isNarrowing ? LaneData({1, currData[1] / bitCastRatio})
-                            : LaneData({1, currData[1] * bitCastRatio});
+  // Check if the bitcast requires cross lane communication.
+  if ((currData[rank - 1] * outElemTyBitWidth) % inElemTyBitWidth != 0) {
+    bitcast.emitWarning(
+        "Narrowing bitcast with cross lane communication is not supported.");
+    return;
+  }
+  // Decide lane data based on whether the bitcast is narrowing or widening.
+  int64_t innerMostLaneData = isNarrowing ? currData[rank - 1] / bitCastRatio
+                                          : currData[rank - 1] * bitCastRatio;
+  sourceLaneDataStorage.push_back(innerMostLaneData);
+  LaneData sourceLaneData(sourceLaneDataStorage);
 
-  propagateIfChanged(operands[0],
-                     operands[0]->meet(LayoutInfo(newLaneLayout, newLaneData)));
+  propagateIfChanged(operands[0], operands[0]->meet(LayoutInfo(
+                                      sourceLaneLayout, sourceLaneData)));
 }
 
 /// Propagate the layout of the result to the tensor descriptor and mask

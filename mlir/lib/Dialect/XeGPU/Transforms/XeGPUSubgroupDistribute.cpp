@@ -200,6 +200,7 @@ struct MoveFuncBodyToWarpExecuteOnLane0
     // Create a new function with the same signature.
     auto newGpuFunc = rewriter.create<gpu::GPUFuncOp>(
         gpuFuncOp.getLoc(), gpuFuncOp.getName(), gpuFuncOp.getFunctionType());
+    newGpuFunc->setAttrs(gpuFuncOp->getAttrs());
     // Create a WarpExecuteOnLane0Op with same arguments and results as the
     // original gpuFuncOp.
     rewriter.setInsertionPointToEnd(&newGpuFunc.getFunctionBody().front());
