@@ -62,9 +62,16 @@ struct Layout {
   SmallVector<int64_t, 3> layout;
   Layout() = default;
   Layout(std::initializer_list<int64_t> list) : layout(list) {}
+  Layout(SmallVector<int64_t, 3> &list) : layout(list) {}
   void print(llvm::raw_ostream &os) const;
   size_t size() const { return layout.size(); }
+  int64_t operator[](size_t idx) const;
 };
+
+int64_t Layout::operator[](size_t idx) const {
+  assert(idx < layout.size() && "Index out of bounds");
+  return layout[idx];
+}
 
 void Layout::print(llvm::raw_ostream &os) const {
   os << llvm::interleaved_array(layout);
@@ -529,16 +536,64 @@ void LayoutInfoPropagation::visitVectorBitcastOp(
       bitcast.getSourceVectorType().getElementType().getIntOrFloatBitWidth();
   int outElemTyBitWidth =
       bitcast.getResultVectorType().getElementType().getIntOrFloatBitWidth();
-
-  // NOTE: We do not expect widening or narrowing bitcasts at this stage. Emit
-  // a warning and return.
-  if (inElemTyBitWidth != outElemTyBitWidth) {
-    bitcast.emitWarning("Widening or narrowing bitcasts are not expected at "
-                        "layout propagation stage.");
+  // If the element bit widths are the same, then the layout does not change.
+  if (inElemTyBitWidth == outElemTyBitWidth) {
+    propagateIfChanged(operands[0], operands[0]->meet(resultLayout));
     return;
   }
+  int64_t rank = bitcast.getSourceVectorType().getRank();
+  // Bitcast is a `narrowing` if the input element type bit width larger than
+  // the output element type bit width. eg. f32 -> f16 is a narrowing bitcast.
+  bool isNarrowing = inElemTyBitWidth > outElemTyBitWidth;
+  int bitCastRatio = isNarrowing ? inElemTyBitWidth / outElemTyBitWidth
+                                 : outElemTyBitWidth / inElemTyBitWidth;
+  const LaneLayout &sourceLaneLayout =
+      resultLayout.getLayout(); // source lane layout is unchanged.
+  ArrayRef<int64_t> currData = resultLayout.getDataAsArrayRef();
 
-  propagateIfChanged(operands[0], operands[0]->meet(resultLayout));
+  // TODO: Currently we assume that bitcasts does not require cross lane
+  // communication. So each lane must own the required number of elements to
+  // perform the bitcast locally without cross-lane communication.
+  // For 1D vectors, decide how many elements each lane owns based on whether
+  // the bitcast is narrowing or widening.
+  if (rank == 1) {
+    if ((currData[0] * outElemTyBitWidth) % inElemTyBitWidth != 0) {
+      bitcast.emitWarning(
+          "Narrowing bitcast with cross lane communication is not supported.");
+      return;
+    }
+    LaneData sourceLaneData = isNarrowing
+                                  ? LaneData({currData[0] / bitCastRatio})
+                                  : LaneData({currData[0] * bitCastRatio});
+
+    propagateIfChanged(operands[0], operands[0]->meet(LayoutInfo(
+                                        sourceLaneLayout, sourceLaneData)));
+  }
+  // For nD vectors, Each lane is not allowed to own multiple elements in any
+  // dimension other than the innermost dimension.
+  // TODO: Add support for other case depending on the use case.
+  SmallVector<int64_t, 3> sourceLaneDataStorage(currData.begin(),
+                                                currData.end() - 1);
+  if (llvm::any_of(sourceLaneDataStorage, [](int64_t d) { return d != 1; })) {
+    bitcast.emitWarning(
+        "Each lane must not own multiple elements in any dimension other than "
+        "the innermost dimension.");
+    return;
+  }
+  // Check if the bitcast requires cross lane communication.
+  if ((currData[rank - 1] * outElemTyBitWidth) % inElemTyBitWidth != 0) {
+    bitcast.emitWarning(
+        "Narrowing bitcast with cross lane communication is not supported.");
+    return;
+  }
+  // Decide lane data based on whether the bitcast is narrowing or widening.
+  int64_t innerMostLaneData = isNarrowing ? currData[rank - 1] / bitCastRatio
+                                          : currData[rank - 1] * bitCastRatio;
+  sourceLaneDataStorage.push_back(innerMostLaneData);
+  LaneData sourceLaneData(sourceLaneDataStorage);
+
+  propagateIfChanged(operands[0], operands[0]->meet(LayoutInfo(
+                                      sourceLaneLayout, sourceLaneData)));
 }
 
 /// Propagate the layout of the result to the tensor descriptor and mask
