@@ -238,3 +238,21 @@ spirv::getMemoryModel(spirv::TargetEnvAttr targetAttr) {
   }
   return failure();
 }
+
+StringRef spirv::getExecutionModeFuncAttrName() {
+  return "spirv.execution_mode";
+}
+
+spirv::ExecutionModeFuncAttributeAttr
+spirv::lookupExecModeFuncAttr(Operation *op) {
+  while (op && !isa<FunctionOpInterface>(op))
+    op = op->getParentOp();
+  if (!op)
+    return {};
+
+  if (auto attr = op->getAttrOfType<spirv::ExecutionModeFuncAttributeAttr>(
+          spirv::getExecutionModeFuncAttrName()))
+    return attr;
+
+  return {};
+}

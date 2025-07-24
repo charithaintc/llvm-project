@@ -56,6 +56,17 @@ def SPIRV_LinkageAttributesAttr : SPIRV_Attr<"LinkageAttributes", "linkage_attri
   let assemblyFormat = "`<` struct(params) `>`";
 }
 
+// This attribute specifies SPIR-V execution mode information via GPU functions
+// 1) Execution mode attribute.
+// 2) [optional] Execution mode value.
+def SPIRV_ExecutionModeFuncAttributeAttr : SPIRV_Attr<"ExecutionModeFuncAttribute", "execution_mode_func_attribute"> {
+  let parameters = (ins
+    "mlir::spirv::ExecutionModeAttr":$execution_mode,
+    OptionalParameter<"std::optional<uint32_t>">:$value
+  );
+  let assemblyFormat = "`<` struct(params) `>`";
+}
+
 // Description of cooperative matrix operations supported on the
 // target. Represents `VkCooperativeMatrixPropertiesKHR`. See
 // https://registry.khronos.org/vulkan/specs/1.3-extensions/man/html/VkCooperativeMatrixPropertiesKHR.html

@@ -4224,7 +4224,14 @@ def SPIRV_BFloat16KHR : TypeAlias<BF16, "BFloat16">;
 def SPIRV_Float : FloatOfWidths<[16, 32, 64]>;
 def SPIRV_Float16or32 : FloatOfWidths<[16, 32]>;
 def SPIRV_AnyFloat : AnyTypeOf<[SPIRV_Float, SPIRV_BFloat16KHR]>;
-def SPIRV_Vector : VectorOfLengthAndType<[2, 3, 4, 8, 16],
+// Remove the vector size restriction.
+// Vector type is quite restrictive in SPIR-V.
+// It only allows length of 2, 3, and 4 by default and
+// additionally 8, and 16 via vector16 capability.
+// However, Intel SPIR-V extension removes this restriction
+// via VectorAnyINTEL capability (SPV_INTEL_vector_compute extension).
+// It allows vector length of 2 to 2^32-1.
+def SPIRV_Vector : VectorOfLengthRangeAndType<[2, 0xFFFFFFFF],
                                        [SPIRV_Bool, SPIRV_Integer, SPIRV_AnyFloat]>;
 // Component type check is done in the type parser for the following SPIR-V
 // dialect-specific types so we use "Any" here.
@@ -4277,7 +4284,7 @@ class SPIRV_MatrixOfType<list<Type> allowedTypes> :
     "Matrix">;
 
 class SPIRV_VectorOf<Type type> :
-    VectorOfLengthAndType<[2, 3, 4, 8, 16], [type]>;
+    VectorOfLengthRangeAndType<[2, 0xFFFFFFFF], [type]>;
 
 class SPIRV_ScalarOrVectorOf<Type type> :
     AnyTypeOf<[type, SPIRV_VectorOf<type>]>;

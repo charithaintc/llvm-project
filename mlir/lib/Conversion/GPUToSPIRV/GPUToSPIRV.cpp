@@ -346,6 +346,20 @@ LogicalResult GPUFuncOpConversion::matchAndRewrite(
     return failure();
   newFuncOp->removeAttr(
       rewriter.getStringAttr(gpu::GPUDialect::getKernelFuncAttrName()));
+
+  auto execModeFuncAttr = spirv::lookupExecModeFuncAttr(funcOp);
+  if (execModeFuncAttr) {
+    spirv::ExecutionModeAttr executionMode =
+        execModeFuncAttr.getExecutionMode();
+    std::optional<uint32_t> modeVal = execModeFuncAttr.getValue();
+
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPointAfter(newFuncOp);
+
+    rewriter.create<spirv::ExecutionModeOp>(funcOp.getLoc(), newFuncOp,
+                                            executionMode.getValue(), *modeVal);
+  }
+
   return success();
 }
 

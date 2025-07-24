@@ -153,12 +153,32 @@ def XeGPU_CacheHintAttr
 }
 
 def XeGPU_FenceScopeWorkgroup: I32EnumAttrCase<"Workgroup", 0, "workgroup">;
-def XeGPU_FenceScopeGPU: I32EnumAttrCase<"GPU", 1, "gpu">;
+def XeGPU_FenceScopeLocal: I32EnumAttrCase<"Local", 1, "local">;
+def XeGPU_FenceScopeTile: I32EnumAttrCase<"Tile", 2, "tile">;
+def XeGPU_FenceScopeGPU: I32EnumAttrCase<"GPU", 3, "gpu">;
+def XeGPU_FenceScopeSystem: I32EnumAttrCase<"System", 4, "system">;
 def XeGPU_FenceScope: I32EnumAttr<"FenceScope",
       "The enumeration for the scope of fence operation.",
-      [XeGPU_FenceScopeWorkgroup, XeGPU_FenceScopeGPU]> {
+      [XeGPU_FenceScopeWorkgroup, XeGPU_FenceScopeLocal, XeGPU_FenceScopeTile, XeGPU_FenceScopeGPU,
+      XeGPU_FenceScopeSystem]> {
   let genSpecializedAttr = 0;
   let cppNamespace = "::mlir::xegpu";
+}
+
+def XeGPU_FenceOpFlushNone: I32EnumAttrCase<"None", 0, "none">;
+def XeGPU_FenceOpFlushEvict: I32EnumAttrCase<"Evict", 1, "evict">;
+def XeGPU_FenceOpFlushInvalidate: I32EnumAttrCase<"Invalidate", 2, "invalidate">;
+def XeGPU_FenceOpFlushDiscard: I32EnumAttrCase<"Discard", 3, "discard">;
+def XeGPU_FenceOpFlush: I32EnumAttr<"FenceOpFlush",
+      "The enumeration for the scope of fence cache flushing.",
+      [XeGPU_FenceOpFlushNone, XeGPU_FenceOpFlushEvict, XeGPU_FenceOpFlushInvalidate, XeGPU_FenceOpFlushDiscard]> {
+  let genSpecializedAttr = 0;
+  let cppNamespace = "::mlir::xegpu";
+}
+def XeGPU_FenceOpFlushAttr:
+  EnumAttr<XeGPU_Dialect, XeGPU_FenceOpFlush, "fence_cache_flushing"> {
+    let summary = [{Describes the cache flushing for fence op.}];
+    let assemblyFormat = "$value";
 }
 
 def XeGPU_FenceScopeAttr:

@@ -28,9 +28,9 @@ module attributes {
     #spirv.vce<v1.0, [Int8, Int16, Int64, Float16, Float64, Shader], []>, #spirv.resource_limits<>>
 } {
 
-func.func @unsupported_5elem_vector(%arg0: vector<5xi32>) {
+func.func @unsupported_5elem_vector(%arg0: vector<5xi32>, %arg1: vector<5xi32>) {
   // expected-error@+1 {{failed to legalize operation 'arith.subi'}}
-  %1 = arith.subi %arg0, %arg0: vector<5xi32>
+  %1 = arith.subi %arg0, %arg1: vector<5xi32>
   return
 }
 
@@ -125,7 +125,7 @@ func.func @unsupported_constant_tensor_2xf64_0() {
 func.func @constant_dense_resource_non_existant() {
   // expected-error @+2 {{failed to legalize operation 'arith.constant'}}
   // expected-error @+1 {{could not find resource blob}}
-  %0 = arith.constant dense_resource<non_existant> : tensor<5xf32>  
+  %0 = arith.constant dense_resource<non_existant> : tensor<5xf32>
   return
 }
 
@@ -135,7 +135,7 @@ module {
 func.func @constant_dense_resource_invalid_buffer() {
   // expected-error @+2 {{failed to legalize operation 'arith.constant'}}
   // expected-error @+1 {{resource is not a valid buffer}}
-  %0 = arith.constant dense_resource<dense_resource_test_2xi32> : vector<2xi32>  
+  %0 = arith.constant dense_resource<dense_resource_test_2xi32> : vector<2xi32>
   return
   }
 }

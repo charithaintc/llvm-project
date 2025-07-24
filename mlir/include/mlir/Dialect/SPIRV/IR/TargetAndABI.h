@@ -137,6 +137,14 @@ FailureOr<ExecutionModel> getExecutionModel(TargetEnvAttr targetAttr);
 /// Returns failure if it cannot be selected.
 FailureOr<MemoryModel> getMemoryModel(TargetEnvAttr targetAttr);
 
+/// Returns the attribute name for specifying execution mode attribute
+/// information.
+StringRef getExecutionModeFuncAttrName();
+
+/// Queries the Execution Mode Attribute on the nearest function-like op
+/// containing the given `op`. Returns null attribute if not found.
+ExecutionModeFuncAttributeAttr lookupExecModeFuncAttr(Operation *op);
+
 } // namespace spirv
 } // namespace mlir
 

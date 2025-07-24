@@ -27,7 +27,7 @@ func.func @exp(%arg0 : i32) -> () {
 // -----
 
 func.func @exp(%arg0 : vector<5xf32>) -> () {
-  // expected-error @+1 {{op operand #0 must be 16/32-bit float or vector of 16/32-bit float values of length 2/3/4}}
+  // CHECK: spirv.GL.Exp {{%.*}} : vector<5xf32
   %2 = spirv.GL.Exp %arg0 : vector<5xf32>
   return
 }
@@ -674,7 +674,7 @@ func.func @findumsb(%arg0 : i64) -> () {
 // -----
 
 //===----------------------------------------------------------------------===//
-// spirv.GL.Distance 
+// spirv.GL.Distance
 //===----------------------------------------------------------------------===//
 
 func.func @distance_scalar(%arg0 : f32, %arg1 : f32) {
@@ -900,7 +900,7 @@ func.func @exp2_invalid_type(%arg0 : i32) -> () {
 // -----
 
 //===----------------------------------------------------------------------===//
-// spirv.GL.PackHalf2x16 
+// spirv.GL.PackHalf2x16
 //===----------------------------------------------------------------------===//
 
 func.func @pack_half_2x16(%arg0 : vector<2xf32>) -> () {
@@ -952,7 +952,7 @@ func.func @unpack_half_2x16_vector_out(%arg0 : vector<2xf32>) -> () {
 // -----
 
 //===----------------------------------------------------------------------===//
-// spirv.GL.UnpackHalf2x16 
+// spirv.GL.UnpackHalf2x16
 //===----------------------------------------------------------------------===//
 
 func.func @unpack_half_2x16(%arg0 : i32) -> () {

@@ -100,9 +100,10 @@ bool CompositeType::classof(Type type) {
 }
 
 bool CompositeType::isValid(VectorType type) {
-  return type.getRank() == 1 &&
-         llvm::is_contained({2, 3, 4, 8, 16}, type.getNumElements()) &&
-         llvm::isa<ScalarType>(type.getElementType());
+  // Number of elements should be between [2 to 2^32 - 1].
+  return type.getRank() == 1 && mlir::isa<ScalarType>(type.getElementType()) &&
+         type.getNumElements() >= 2 &&
+         type.getNumElements() <= std::numeric_limits<uint32_t>::max();
 }
 
 Type CompositeType::getElementType(unsigned index) const {
@@ -173,7 +174,21 @@ void CompositeType::getCapabilities(
       .Case<VectorType>([&](VectorType type) {
         auto vecSize = getNumElements();
         if (vecSize == 8 || vecSize == 16) {
-          static const Capability caps[] = {Capability::Vector16};
+          static const Capability caps[] = {Capability::Vector16,
+                                            Capability::VectorAnyINTEL};
+          ArrayRef<Capability> ref(caps, std::size(caps));
+          capabilities.push_back(ref);
+        }
+        // If the vector size is between [2 to 2^32 - 1]
+        // and not of any size 2, 3, 4, 8, and 16
+        // VectorAnyIntel Capability must be present
+        // for the SPIR-V to be valid
+        llvm::SmallVector<uint32_t, 5> allowedVecRange = {2, 3, 4, 8, 16};
+        if (vecSize >= 2 &&
+            (llvm::none_of(allowedVecRange, [&](uint32_t allowedVecSize) {
+              return vecSize == allowedVecSize;
+            }))) {
+          static const Capability caps[] = {Capability::VectorAnyINTEL};
           ArrayRef<Capability> ref(caps, std::size(caps));
           capabilities.push_back(ref);
         }
