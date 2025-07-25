@@ -27,6 +27,7 @@
 #include "mlir/IR/Value.h"
 #include "mlir/IR/Visitors.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Support/LLVM.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -912,9 +913,23 @@ void XeGPUSubgroupDistributePass::runOnOperation() {
     return;
   }
 
-  // Step 4: Finllay, clean up UnrealizedConversionCastOps that were inserted
+  // Step 4: Finally, clean up UnrealizedConversionCastOps that were inserted
   // due to tensor desc type mismatches created by using upstream distribution
-  // patterns (scf.for)
+  // patterns (scf.for). This cleanup should only be done if all the ops are
+  // distributed successfully, if some ops are still not distributed and remains
+  // inside any WarpExecuteOnLane0Op we avoid this simplication step to avoid
+  // breaking the IR.
+  bool foundWarpOp = false;
+  getOperation()->walk([&](gpu::WarpExecuteOnLane0Op warpOp) {
+    // Look for WarpOps that are not trivially dead.
+    if (isOpTriviallyDead(warpOp))
+      return WalkResult::advance();
+    foundWarpOp = true;
+    return WalkResult::interrupt();
+  });
+  if (foundWarpOp)
+    return;
+
   getOperation()->walk([&](mlir::UnrealizedConversionCastOp op) {
     // We are only interested in UnrealizedConversionCastOps there were added
     // for resolving SIMT type mismatches.
@@ -933,7 +948,7 @@ void XeGPUSubgroupDistributePass::runOnOperation() {
            "Unrealized conversion cast must have tensor descriptor types");
 
     // tensor_desc<shape, layout> -> tensor_desc<shape> Type of conversions.
-    // This occurs iside scf.for body to resolve the block argument type to
+    // This occurs inside scf.for body to resolve the block argument type to
     // SIMT type.
     if (inputDescType.getLayout()) {
       auto argument = mlir::dyn_cast<mlir::BlockArgument>(input);
