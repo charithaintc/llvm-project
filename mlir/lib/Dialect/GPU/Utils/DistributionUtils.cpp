@@ -57,26 +57,24 @@ WarpDistributionPattern::moveRegionToNewWarpOpAndAppendReturns(
                           warpOp.getResultTypes().end());
   auto yield = cast<gpu::YieldOp>(
       warpOp.getBodyRegion().getBlocks().begin()->getTerminator());
-  llvm::SmallSetVector<Value, 32> yieldValues(yield.getOperands().begin(),
-                                              yield.getOperands().end());
+  SmallVector<Value> yieldValues(yield.getOperands().begin(),
+                                 yield.getOperands().end());
+
   for (auto [value, type] : llvm::zip_equal(newYieldedValues, newReturnTypes)) {
-    if (yieldValues.insert(value)) {
+    auto *it = llvm::find(yieldValues, value);
+    if (it != yieldValues.end()) {
+      // If the value already exists in the yield, don't create a new output.
+      indices.push_back(std::distance(yieldValues.begin(), it));
+    } else {
+      // If the value is new, add it to the yield and to the types.
+      yieldValues.push_back(value);
       types.push_back(type);
       indices.push_back(yieldValues.size() - 1);
-    } else {
-      // If the value already exit the region don't create a new output.
-      for (auto [idx, yieldOperand] :
-           llvm::enumerate(yieldValues.getArrayRef())) {
-        if (yieldOperand == value) {
-          indices.push_back(idx);
-          break;
-        }
-      }
     }
   }
-  yieldValues.insert_range(newYieldedValues);
+
   WarpExecuteOnLane0Op newWarpOp = moveRegionToNewWarpOpAndReplaceReturns(
-      rewriter, warpOp, yieldValues.getArrayRef(), types);
+      rewriter, warpOp, yieldValues, types);
   rewriter.replaceOp(warpOp,
                      newWarpOp.getResults().take_front(warpOp.getNumResults()));
   return newWarpOp;
