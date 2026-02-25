@@ -38,6 +38,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/SmallVectorExtras.h"
+#include "llvm/Support/raw_ostream.h"
 
 namespace mlir {
 namespace xegpu {
@@ -201,6 +202,7 @@ struct MoveFuncBodyToWarpOp : public OpRewritePattern<gpu::GPUFuncOp> {
     rewriter.setInsertionPointAfter(warpOp);
     gpu::ReturnOp::create(rewriter, newGpuFunc.getLoc(), warpOp.getResults());
     rewriter.replaceOp(gpuFuncOp, newGpuFunc);
+    llvm::errs() << "Finished moving function body to warp op.\n";
     return success();
   }
 };
@@ -2097,12 +2099,15 @@ void xegpu::populateXeGPUMoveFuncBodyToWarpOpPatterns(
 }
 
 void XeGPUSubgroupDistributePass::runOnOperation() {
+  llvm::errs() << "Running XeGPUSubgroupDistributePass\n";
   // Step 1: Attach layouts to op operands.
   // TODO: Following assumptions are made:
   // 1) It is assumed that there are no layout conflicts.
   // 2) Any existing layout attributes attached to the operands are ignored.
   Operation *op = getOperation();
   if (!xegpu::recoverTemporaryLayouts(op)) {
+    llvm::errs()
+        << "Failed to recover temporary layouts for subgroup distribution.\n";
     signalPassFailure();
     return;
   }
@@ -2126,6 +2131,10 @@ void XeGPUSubgroupDistributePass::runOnOperation() {
         vector::moveScalarUniformCode(warpOp);
     });
   }
+  llvm::errs() << "Finished moving function body to warp op.\n";
+  // Print the IR here.
+  getOperation()->print(llvm::errs());
+  llvm::errs() << "\n";
   // Step 3: Apply subgroup to workitem distribution patterns.
   RewritePatternSet patterns(&getContext());
   xegpu::populateXeGPUSubgroupDistributePatterns(patterns);
@@ -2168,6 +2177,7 @@ void XeGPUSubgroupDistributePass::runOnOperation() {
       patterns, distributionFn, shuffleFn,
       /*pattern benefit=*/PatternHierarchy::Regular);
   if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
+    llvm::errs() << "Failed to apply subgroup distribution patterns.\n";
     signalPassFailure();
     return;
   }
@@ -2232,4 +2242,7 @@ void XeGPUSubgroupDistributePass::runOnOperation() {
       op->erase();
     return WalkResult::advance();
   });
+  llvm::errs() << "Finished XeGPUSubgroupDistributePass.\n";
+  getOperation()->print(llvm::errs());
+  llvm::errs() << "\n";
 }

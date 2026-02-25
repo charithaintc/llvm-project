@@ -14,6 +14,7 @@
 #include "mlir/Dialect/XeGPU/Utils/XeGPUUtils.h"
 #include "llvm/ADT/SmallVectorExtras.h"
 
+#include <cstdint>
 #include <optional>
 
 #include "llvm/Support/DebugLog.h"
@@ -122,17 +123,15 @@ static std::optional<T> findProducerOfType(Value val) {
 }
 
 /// Create a layout attribute from the given parameters.
-static xegpu::LayoutAttr
-createLayoutAttr(MLIRContext *ctx, ArrayRef<int32_t> sgLayout,
-                 ArrayRef<int32_t> sgData,
-                 std::optional<ArrayRef<int32_t>> instData) {
+static xegpu::LayoutAttr createLayoutAttr(
+    MLIRContext *ctx, ArrayRef<int32_t> sgLayout, ArrayRef<int32_t> sgData,
+    std::optional<ArrayRef<int32_t>> instData, ArrayRef<int32_t> order) {
   return xegpu::LayoutAttr::get(
       ctx, DenseI32ArrayAttr::get(ctx, sgLayout),
       DenseI32ArrayAttr::get(ctx, sgData),
       instData ? DenseI32ArrayAttr::get(ctx, instData.value()) : nullptr,
       /*lane_layout=*/nullptr,
-      /*lane_data=*/nullptr,
-      /*order=*/nullptr);
+      /*lane_data=*/nullptr, DenseI32ArrayAttr::get(ctx, order));
 }
 
 /// Generate `xegpu::LayoutAttr` from op mixed layout values.
@@ -142,6 +141,7 @@ getLayoutAttrFromOperands(MLIRContext *ctx, transform::TransformState &state,
                           ArrayRef<::mlir::OpFoldResult> mixedSgLayout,
                           ArrayRef<::mlir::OpFoldResult> mixedSgData,
                           ArrayRef<::mlir::OpFoldResult> mixedInstData,
+                          ArrayRef<int32_t> order,
                           xegpu::LayoutAttr &layoutAttr) {
   SmallVector<int32_t> sgLayout, sgData, instData;
   auto status =
@@ -160,7 +160,7 @@ getLayoutAttrFromOperands(MLIRContext *ctx, transform::TransformState &state,
                            ? std::nullopt
                            : std::optional<ArrayRef<int32_t>>(instData);
 
-  layoutAttr = createLayoutAttr(ctx, sgLayout, sgData, maybeInstData);
+  layoutAttr = createLayoutAttr(ctx, sgLayout, sgData, maybeInstData, order);
 
   return DiagnosedSilenceableFailure::success();
 }
@@ -246,7 +246,7 @@ transform::SetDescLayoutOp::apply(transform::TransformRewriter &rewriter,
   xegpu::LayoutAttr layoutAttr = nullptr;
   auto status = getLayoutAttrFromOperands(getContext(), state, (*this),
                                           getMixedSgLayout(), getMixedSgData(),
-                                          getMixedInstData(), layoutAttr);
+                                          getMixedInstData(), {}, layoutAttr);
   if (!status.succeeded())
     return status;
 
@@ -291,7 +291,7 @@ void transform::SetOpLayoutAttrOp::build(
     OpBuilder &builder, OperationState &ostate, Value target, int64_t index,
     ArrayRef<OpFoldResult> mixedSgLayout, ArrayRef<OpFoldResult> mixedSgData,
     ArrayRef<OpFoldResult> mixedInstData, ArrayRef<int64_t> sliceDims,
-    bool result, bool operand) {
+    ArrayRef<int32_t> order, bool result, bool operand) {
   SmallVector<int64_t> staticSgLayout, staticSgData, staticInstData;
   SmallVector<Value> dynamicSgLayout, dynamicSgData, dynamicInstData;
   dispatchIndexOpFoldResults(mixedSgLayout, dynamicSgLayout, staticSgLayout);
@@ -307,6 +307,7 @@ void transform::SetOpLayoutAttrOp::build(
         /*static_sg_data=*/staticSgData,
         /*static_inst_data=*/staticInstData,
         /*slice_dims=*/sliceDims,
+        /*order=*/order,
         /*result=*/result,
         /*operand=*/operand);
 }
@@ -336,9 +337,9 @@ transform::SetOpLayoutAttrOp::apply(transform::TransformRewriter &rewriter,
   }
 
   xegpu::LayoutAttr layoutAttr = nullptr;
-  auto status = getLayoutAttrFromOperands(getContext(), state, (*this),
-                                          getMixedSgLayout(), getMixedSgData(),
-                                          getMixedInstData(), layoutAttr);
+  auto status = getLayoutAttrFromOperands(
+      getContext(), state, (*this), getMixedSgLayout(), getMixedSgData(),
+      getMixedInstData(), getOrder(), layoutAttr);
   if (!status.succeeded())
     return status;
 
@@ -655,14 +656,14 @@ transform::ConvertLayoutOp::apply(transform::TransformRewriter &rewriter,
   xegpu::LayoutAttr inputLayoutAttr = nullptr;
   auto status = getLayoutAttrFromOperands(
       getContext(), state, (*this), getMixedInputSgLayout(),
-      getMixedInputSgData(), getMixedInputInstData(), inputLayoutAttr);
+      getMixedInputSgData(), getMixedInputInstData(), {}, inputLayoutAttr);
   if (!status.succeeded())
     return status;
 
   xegpu::LayoutAttr targetLayoutAttr = nullptr;
   status = getLayoutAttrFromOperands(
       getContext(), state, (*this), getMixedTargetSgLayout(),
-      getMixedTargetSgData(), getMixedTargetInstData(), targetLayoutAttr);
+      getMixedTargetSgData(), getMixedTargetInstData(), {}, targetLayoutAttr);
   if (!status.succeeded())
     return status;
 

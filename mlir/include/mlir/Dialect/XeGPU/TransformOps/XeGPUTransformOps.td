@@ -128,6 +128,7 @@ def SetOpLayoutAttrOp : Op<Transform_Dialect, "xegpu.set_op_layout_attr", [
                    DefaultValuedOptionalAttr<DenseI64ArrayAttr, "{}">:$static_sg_data,
                    DefaultValuedOptionalAttr<DenseI64ArrayAttr, "{}">:$static_inst_data,
                    DefaultValuedOptionalAttr<DenseI64ArrayAttr, "{}">:$slice_dims,
+                   DefaultValuedOptionalAttr<DenseI32ArrayAttr, "{}">:$order,
                    DefaultValuedAttr<UnitAttr, "false">:$result,
                    DefaultValuedAttr<UnitAttr, "false">:$operand
                    );
@@ -140,6 +141,7 @@ def SetOpLayoutAttrOp : Op<Transform_Dialect, "xegpu.set_op_layout_attr", [
                    "ArrayRef<OpFoldResult>":$mixedSgData,
                    "ArrayRef<OpFoldResult>":$mixedInstData,
                    "ArrayRef<int64_t>":$sliceDims,
+                   "ArrayRef<int32_t>":$order,
                    CArg<"bool", "false">:$result,
                    CArg<"bool", "false">:$operand
                    )>,
@@ -151,6 +153,7 @@ def SetOpLayoutAttrOp : Op<Transform_Dialect, "xegpu.set_op_layout_attr", [
     `sg_data` `=` custom<DynamicIndexList>($sg_data, $static_sg_data)
     (`inst_data` `=` custom<DynamicIndexList>($inst_data, $static_inst_data)^)?
     (`slice_dims` `=` $slice_dims^)?
+    (`order` `=` $order^)?
     attr-dict `:` qualified(type(operands))
   }];
 
