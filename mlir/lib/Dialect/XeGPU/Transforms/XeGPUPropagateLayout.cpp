@@ -1290,13 +1290,13 @@ LogicalResult ResolveLayoutConflicts::run() {
         }
       }
       // Handle conflicts in vector operands.
-      if (isa<VectorType>(operandType)) {
-        auto res = resolveVectorConsumer(operand);
-        if (failed(res)) {
-          DBGS() << "Failed to resolve vector consumer: " << *op << "\n";
-          return WalkResult::interrupt();
-        }
-      }
+      // if (isa<VectorType>(operandType)) {
+      //   auto res = resolveVectorConsumer(operand);
+      //   if (failed(res)) {
+      //     DBGS() << "Failed to resolve vector consumer: " << *op << "\n";
+      //     return WalkResult::interrupt();
+      //   }
+      // }
     }
     return WalkResult::advance();
   });

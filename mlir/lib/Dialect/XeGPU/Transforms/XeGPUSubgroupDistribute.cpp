@@ -38,7 +38,6 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/SmallVectorExtras.h"
-#include "llvm/Support/raw_ostream.h"
 
 namespace mlir {
 namespace xegpu {
@@ -202,7 +201,6 @@ struct MoveFuncBodyToWarpOp : public OpRewritePattern<gpu::GPUFuncOp> {
     rewriter.setInsertionPointAfter(warpOp);
     gpu::ReturnOp::create(rewriter, newGpuFunc.getLoc(), warpOp.getResults());
     rewriter.replaceOp(gpuFuncOp, newGpuFunc);
-    llvm::errs() << "Finished moving function body to warp op.\n";
     return success();
   }
 };
@@ -1510,13 +1508,14 @@ struct VectorBroadcastDistribution : public gpu::WarpDistributionPattern {
 
       // Case 1 and 2: source is a vector type.
       int64_t rankDiff = destType.getRank() - sourceType.getRank();
-      if (rankDiff > 0) {
-        // Case 1: source is lower-rank than result.
-        bool isSliceOf = sourceLayout.isSliceOf(resultLayout);
-        if (!isSliceOf)
-          broadcastOp.emitWarning()
-              << "Broadcast input layout must be a slice of result layout.";
-      }
+      //   if (rankDiff > 0) {
+      //     // Case 1: source is lower-rank than result.
+      //     // bool isSliceOf = sourceLayout.isSliceOf(resultLayout);
+      //     // if (!isSliceOf)
+      //     //   broadcastOp.emitWarning()
+      //     //       << "Broadcast input layout must be a slice of result
+      //     layout.";
+      //   }
       // case 2: source and result have same rank
       if (rankDiff == 0) {
         auto broadcastUnitDimsSet = broadcastOp.computeBroadcastedUnitDims();
@@ -2099,15 +2098,12 @@ void xegpu::populateXeGPUMoveFuncBodyToWarpOpPatterns(
 }
 
 void XeGPUSubgroupDistributePass::runOnOperation() {
-  llvm::errs() << "Running XeGPUSubgroupDistributePass\n";
   // Step 1: Attach layouts to op operands.
   // TODO: Following assumptions are made:
   // 1) It is assumed that there are no layout conflicts.
   // 2) Any existing layout attributes attached to the operands are ignored.
   Operation *op = getOperation();
   if (!xegpu::recoverTemporaryLayouts(op)) {
-    llvm::errs()
-        << "Failed to recover temporary layouts for subgroup distribution.\n";
     signalPassFailure();
     return;
   }
@@ -2131,10 +2127,6 @@ void XeGPUSubgroupDistributePass::runOnOperation() {
         vector::moveScalarUniformCode(warpOp);
     });
   }
-  llvm::errs() << "Finished moving function body to warp op.\n";
-  // Print the IR here.
-  getOperation()->print(llvm::errs());
-  llvm::errs() << "\n";
   // Step 3: Apply subgroup to workitem distribution patterns.
   RewritePatternSet patterns(&getContext());
   xegpu::populateXeGPUSubgroupDistributePatterns(patterns);
@@ -2177,7 +2169,6 @@ void XeGPUSubgroupDistributePass::runOnOperation() {
       patterns, distributionFn, shuffleFn,
       /*pattern benefit=*/PatternHierarchy::Regular);
   if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
-    llvm::errs() << "Failed to apply subgroup distribution patterns.\n";
     signalPassFailure();
     return;
   }
@@ -2242,7 +2233,4 @@ void XeGPUSubgroupDistributePass::runOnOperation() {
       op->erase();
     return WalkResult::advance();
   });
-  llvm::errs() << "Finished XeGPUSubgroupDistributePass.\n";
-  getOperation()->print(llvm::errs());
-  llvm::errs() << "\n";
 }

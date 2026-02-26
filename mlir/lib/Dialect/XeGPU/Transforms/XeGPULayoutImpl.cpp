@@ -25,6 +25,7 @@
 #include "mlir/Interfaces/LoopLikeInterface.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "llvm/Support/FormatVariadic.h"
+#include "llvm/Support/raw_ostream.h"
 #include <cstdint>
 #include <numeric>
 
@@ -1135,10 +1136,15 @@ xegpu::DistributeLayoutAttr xegpu::getConsumerLayoutAt(OpOperand &operand) {
   if (auto insertSlice = dyn_cast<vector::InsertStridedSliceOp>(op)) {
     if (!resLayout)
       return xegpu::DistributeLayoutAttr();
-    if (idx == 0)
-      return xegpu::inferInsertStridedSliceSourceLayout(
+    if (idx == 0) {
+
+      auto sourceLayout = xegpu::inferInsertStridedSliceSourceLayout(
           resLayout, insertSlice.getDestVectorType().getShape(),
           insertSlice.getSourceVectorType().getShape());
+      llvm::errs() << "insert strided slice source layout: " << sourceLayout
+                   << "\n";
+      return sourceLayout;
+    }
     if (idx == 1)
       return resLayout;
   }
