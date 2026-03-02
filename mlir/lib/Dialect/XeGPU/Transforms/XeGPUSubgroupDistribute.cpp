@@ -2061,6 +2061,43 @@ struct VectorStepSliceDistribution final : public gpu::WarpDistributionPattern {
   }
 };
 
+struct ConvertLayoutDistribution final : public gpu::WarpDistributionPattern {
+  using gpu::WarpDistributionPattern::WarpDistributionPattern;
+  LogicalResult matchAndRewrite(gpu::WarpExecuteOnLane0Op warpOp,
+                                PatternRewriter &rewriter) const override {
+    OpOperand *operand = getWarpResult(warpOp, [&](Operation *op) {
+      if (!isa<xegpu::ConvertLayoutOp>(op))
+        return false;
+      gpu::YieldOp yield = warpOp.getTerminator();
+      return yield->getPrevNode() == op;
+    });
+    if (!operand)
+      return rewriter.notifyMatchFailure(
+          warpOp, "warp result is not a xegpu::ConvertLayout op");
+    // If the distributed result type is eqaul to the output type of the
+    // ConvertLayoutOp, simply forward the input.
+    auto convertLayoutOp =
+        operand->get().getDefiningOp<xegpu::ConvertLayoutOp>();
+    unsigned operandIdx = operand->getOperandNumber();
+    auto distributedType = warpOp.getResult(operandIdx).getType();
+    if (distributedType != convertLayoutOp.getType())
+      return rewriter.notifyMatchFailure(
+          warpOp,
+          "the result type of ConvertLayoutOp must match the distributed type");
+    // llvm::errs() << "sinking ConvertLayoutOp\n";
+    // Yield the source of the ConvertLayoutOp from a new warp op and replace
+    // all uses of the distributed value with the yielded source.
+    SmallVector<size_t> newRetIndices;
+    auto newWarpOp = moveRegionToNewWarpOpAndAppendReturns(
+        rewriter, warpOp, convertLayoutOp.getSource(),
+        TypeRange{convertLayoutOp.getSource().getType()}, newRetIndices);
+    rewriter.setInsertionPointAfter(newWarpOp);
+    Value source = newWarpOp.getResult(newRetIndices[0]);
+    rewriter.replaceAllUsesWith(newWarpOp.getResult(operandIdx), source);
+    return success();
+  }
+};
+
 } // namespace
 
 namespace {
@@ -2079,7 +2116,8 @@ void xegpu::populateXeGPUSubgroupDistributePatterns(
                LoadDistribution, StoreDistribution, VectorTransposeDistribution,
                VectorBitcastDistribution, LoadMatrixDistribution,
                StoreMatrixDistribution,
-               MemrefExtractAlignedPointerAsIndexDistribution>(
+               MemrefExtractAlignedPointerAsIndexDistribution,
+               ConvertLayoutDistribution>(
       patterns.getContext(),
       /*pattern benefit=*/PatternHierarchy::Regular);
   // For following patterns, we need to override the regular vector distribution

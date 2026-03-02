@@ -957,18 +957,18 @@ void LayoutInfoPropagation::visitInsertStridedSliceOp(
   const auto *uArch =
       getUArch(xegpu::getChipStr(insertStridedSlice).value_or(""));
 
-  auto requiredResLayoutAttr = xegpu::setupInsertStridedSliceResultLayout(
-      layoutKind, srcVecType, resVecType, consumerLayoutAttr, uArch);
+  // auto requiredResLayoutAttr = xegpu::setupInsertStridedSliceResultLayout(
+  //     layoutKind, srcVecType, resVecType, consumerLayoutAttr, uArch);
 
   xegpu::setTemporaryLayout(insertStridedSlice->getResult(0),
-                            requiredResLayoutAttr);
+                            consumerLayoutAttr);
 
   auto srcLayoutAttr = xegpu::inferInsertStridedSliceSourceLayout(
-      requiredResLayoutAttr, resVecType.getShape(), srcVecType.getShape());
+      consumerLayoutAttr, resVecType.getShape(), srcVecType.getShape());
 
   propagateIfChanged(operands[0], operands[0]->meet(LayoutInfo(srcLayoutAttr)));
   propagateIfChanged(operands[1],
-                     operands[1]->meet(LayoutInfo(requiredResLayoutAttr)));
+                     operands[1]->meet(LayoutInfo(consumerLayoutAttr)));
 }
 
 /// Propagate the layout of the result to the tensor descriptor, mask and offset
@@ -1290,13 +1290,13 @@ LogicalResult ResolveLayoutConflicts::run() {
         }
       }
       // Handle conflicts in vector operands.
-      // if (isa<VectorType>(operandType)) {
-      //   auto res = resolveVectorConsumer(operand);
-      //   if (failed(res)) {
-      //     DBGS() << "Failed to resolve vector consumer: " << *op << "\n";
-      //     return WalkResult::interrupt();
-      //   }
-      // }
+      if (isa<VectorType>(operandType)) {
+        auto res = resolveVectorConsumer(operand);
+        if (failed(res)) {
+          DBGS() << "Failed to resolve vector consumer: " << *op << "\n";
+          return WalkResult::interrupt();
+        }
+      }
     }
     return WalkResult::advance();
   });
