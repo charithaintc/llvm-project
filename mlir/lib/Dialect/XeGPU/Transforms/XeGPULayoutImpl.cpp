@@ -1144,10 +1144,6 @@ xegpu::DistributeLayoutAttr xegpu::getConsumerLayoutAt(OpOperand &operand) {
       auto sourceLayout = xegpu::inferInsertStridedSliceSourceLayout(
           resLayout, insertSlice.getDestVectorType().getShape(),
           insertSlice.getSourceVectorType().getShape());
-      llvm::errs() << "insert strided slice result layout: " << resLayout
-                   << "\n";
-      llvm::errs() << "insert strided slice source layout: " << sourceLayout
-                   << "\n";
       return sourceLayout;
     }
     if (idx == 1)
