@@ -2004,6 +2004,27 @@ void populateElementwiseOpsFusionPatterns(
     RewritePatternSet &patterns,
     const ControlFusionFn &controlElementwiseOpFusion);
 
+/// Pattern to fuse an `R1 -> E -> R2` chain into `R1`'s loop, where `R1` and
+/// `R2` are `linalg.generic` reductions sharing a reduction dimension and `E`
+/// is an all-parallel elementwise term between them (e.g. converting two-pass
+/// softmax into the online one-pass form). `R1` must already be tiled along
+/// that dimension into an `scf.for` annotated with the `__reduction_loop__`
+/// unit attribute (its `step` is the tile size); this pattern does not tile
+/// `R1` itself.
+///
+/// The pattern matches bottom-up and queries `controlDependantReductionFusion`
+/// once per link of the chain: with `R2`'s input operand that consumes `E`'s
+/// result, and with `E`'s input operand that consumes the producer loop's
+/// result. Returning `false` vetoes fusing through that operand, so a control
+/// function admitting only the operands of one particular triple confines the
+/// fusion to that chain.
+///
+/// See `transform.structured.fuse_dependant_reduction_ops` for the
+/// intended entry point.
+void populateDependantReductionFusionPatterns(
+    RewritePatternSet &patterns,
+    const ControlFusionFn &controlDependantReductionFusion);
+
 /// Function type which is used to control propagation of linalg.pack/unpack
 /// ops.
 using ControlPropagationFn = std::function<bool(OpOperand *opOperand)>;

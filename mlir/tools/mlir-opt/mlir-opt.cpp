@@ -108,6 +108,7 @@ void registerTestInterfaces();
 void registerTestIRVisitorsPass();
 void registerTestLastModifiedPass();
 void registerTestLinalgDecomposeOps();
+void registerTestLinalgDependantReductionFusion();
 void registerTestLinalgDropUnitDims();
 void registerTestLinalgElementwiseFusion();
 void registerTestLinalgGreedyFusion();
@@ -258,6 +259,7 @@ static void registerTestPasses() {
   mlir::test::registerTestIRVisitorsPass();
   mlir::test::registerTestLastModifiedPass();
   mlir::test::registerTestLinalgDecomposeOps();
+  mlir::test::registerTestLinalgDependantReductionFusion();
   mlir::test::registerTestLinalgDropUnitDims();
   mlir::test::registerTestLinalgElementwiseFusion();
   mlir::test::registerTestLinalgGreedyFusion();

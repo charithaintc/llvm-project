@@ -33,6 +33,7 @@ add_mlir_dialect_library(MLIRLinalgTransforms
   Padding.cpp
   PadTilingInterface.cpp
   Promotion.cpp
+  DependantReductionFusion.cpp
   RuntimeOpVerification.cpp
   Specialize.cpp
   Split.cpp

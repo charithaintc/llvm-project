@@ -1407,6 +1407,129 @@ void transform::FuseIntoContainingOp::getEffects(
 }
 
 //===----------------------------------------------------------------------===//
+// FuseDependantReductionOpsOp
+//===----------------------------------------------------------------------===//
+
+DiagnosedSilenceableFailure transform::FuseDependantReductionOpsOp::apply(
+    transform::TransformRewriter &rewriter,
+    transform::TransformResults &transformResults,
+    transform::TransformState &state) {
+  // `R1 -> E -> R2`, one payload op per handle.
+  auto tiledLoops = state.getPayloadOps(getTiledReductionLoop());
+  auto elementwiseOps = state.getPayloadOps(getElementwiseOp());
+  auto consumerOps = state.getPayloadOps(getReductionOp());
+  if (!llvm::hasSingleElement(tiledLoops))
+    return emitDefiniteFailure() << "requires exactly one tiled reduction loop";
+  if (!llvm::hasSingleElement(elementwiseOps))
+    return emitDefiniteFailure() << "requires exactly one elementwise op";
+  if (!llvm::hasSingleElement(consumerOps))
+    return emitDefiniteFailure() << "requires exactly one reduction op";
+
+  auto r1Loop = dyn_cast<scf::ForOp>(*tiledLoops.begin());
+  if (!r1Loop)
+    return emitSilenceableError()
+           << "expected the tiled reduction loop to be an scf.for op";
+  auto e = dyn_cast<linalg::GenericOp>(*elementwiseOps.begin());
+  if (!e)
+    return emitSilenceableError()
+           << "expected the elementwise op to be a linalg.generic op";
+  auto r2 = dyn_cast<linalg::GenericOp>(*consumerOps.begin());
+  if (!r2)
+    return emitSilenceableError()
+           << "expected the reduction op to be a linalg.generic op";
+
+  // The pattern queries the control function once per link of the chain. Admit
+  // only the two links of the selected triple, so no other chain in the payload
+  // (nor an alternative `E`/`R1` for these ops) can be fused.
+  ControlFusionFn controlFn = [&](OpOperand *fusedOperand) {
+    Operation *owner = fusedOperand->getOwner();
+    Operation *producer = fusedOperand->get().getDefiningOp();
+    if (owner == r2.getOperation())
+      return producer == e.getOperation();
+    if (owner == e.getOperation())
+      return producer == r1Loop.getOperation();
+    return false;
+  };
+
+  // Fusing `R2` adds exactly one inner reduction (the correction is
+  // all-parallel), which is how a full fusion is told from one where only `E`
+  // made it in: a partial fusion also creates a new `scf.for`, so the new-loop
+  // check below cannot detect it alone.
+  auto countInnerReductions = [](scf::ForOp loop) {
+    unsigned count = 0;
+    for (Operation &op : loop.getBody()->without_terminator())
+      if (auto generic = dyn_cast<linalg::GenericOp>(&op))
+        if (generic.getNumReductionLoops() != 0)
+          ++count;
+    return count;
+  };
+  unsigned numInnerReductionsBefore = countInnerReductions(r1Loop);
+
+  RewritePatternSet patterns(getContext());
+  linalg::populateDependantReductionFusionPatterns(patterns, controlFn);
+
+  // Tracks new ops so the fused loop can be returned as a handle; forwards to
+  // the rewriter's listener so erasures of the consumed payload ops stay
+  // tracked.
+  NewOpsListener newOpsListener(rewriter.getListener());
+
+  GreedyRewriteConfig config;
+  config.enableFolding(false);
+  config.setUseTopDownTraversal(true);
+  config.setListener(&newOpsListener);
+  // The greedy driver requires its root region to be IsolatedFromAbove. R2's
+  // immediate parent may be a non-isolated region (e.g. an enclosing
+  // `scf.forall`/`scf.for` when the payload was tiled first), so root the
+  // rewrite at the nearest IsolatedFromAbove ancestor instead.
+  Operation *rewriteRoot =
+      r2->getParentWithTrait<OpTrait::IsIsolatedFromAbove>();
+  if (!rewriteRoot)
+    return emitSilenceableError()
+           << "could not find an IsolatedFromAbove ancestor of the reduction "
+              "op to root the fusion rewrite";
+  if (failed(applyPatternsGreedily(rewriteRoot, std::move(patterns), config)))
+    return emitDefaultDefiniteFailure(r2);
+
+  // Each fused consumer replaces the loop with a new one carrying an extra
+  // `iter_arg`, and the listener drops the erased intermediates, so exactly one
+  // new `scf.for` should survive.
+  SmallVector<Operation *> newLoops;
+  for (Operation *newOp : newOpsListener.getNewOps())
+    if (isa<scf::ForOp>(newOp))
+      newLoops.push_back(newOp);
+  if (newLoops.empty())
+    return emitSilenceableError()
+           << "could not fuse the elementwise op and the consumer "
+              "reduction into the producer reduction loop; the chain does not "
+              "satisfy the fusion legality conditions";
+  if (newLoops.size() != 1)
+    return emitSilenceableError()
+           << "expected the fusion to produce exactly one new scf.for loop, "
+              "got "
+           << newLoops.size();
+
+  auto fusedLoop = cast<scf::ForOp>(newLoops.front());
+  if (countInnerReductions(fusedLoop) != numInnerReductionsBefore + 1)
+    return emitSilenceableError()
+           << "fused the elementwise op into the producer reduction loop but "
+              "not the consumer reduction; run with "
+              "`--debug-only=dependant-reduction-fusion` to see which step "
+              "rejected it";
+
+  transformResults.set(cast<OpResult>(getFusedLoop()), {fusedLoop});
+  return DiagnosedSilenceableFailure::success();
+}
+
+void transform::FuseDependantReductionOpsOp::getEffects(
+    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  consumesHandle(getTiledReductionLoopMutable(), effects);
+  consumesHandle(getElementwiseOpMutable(), effects);
+  consumesHandle(getReductionOpMutable(), effects);
+  producesHandle(getOperation()->getOpResults(), effects);
+  modifiesPayload(effects);
+}
+
+//===----------------------------------------------------------------------===//
 // GeneralizeOp
 //===----------------------------------------------------------------------===//
 
