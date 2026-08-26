@@ -41,8 +41,9 @@
 // R2 is fused, reducing E's [64, 32] tile into the carried `s`. Its output does
 // not span the tiled axis, so `s` keeps its full [64] shape.
 // CHECK:           %[[SSLICE:.+]] = tensor.extract_slice %[[SARG]][0] [64] [1]
-// The factor term(new)/term(old) -- E isolated on `m` -- rescales `s` before this
-// tile is accumulated.
+// The factor is term(new)/term(old) -- E isolated on `m`, evaluated with the
+// updated and the previous `m` -- and rescales the running `s` before this
+// tile is accumulated into it.
 // CHECK:           %[[TERMNEW:.+]] = linalg.generic
 // CHECK-SAME:          ins(%[[M]] : tensor<64xf32>)
 // CHECK:             math.exp
@@ -60,8 +61,9 @@
 // CHECK:           tensor.insert_slice %[[E]] into %[[EARG]][0, %[[IV]]] [64, 32] [1, 1]
 // CHECK:           tensor.insert_slice %[[S]] into %[[SARG]][0] [64] [1]
 // CHECK:           scf.yield
-// The ORIGINAL E stays outside, recomputing `p` from the *final* `m`: the fused
-// copy's tiles use the running `m`, which the correction only repairs for `s`.
+// The ORIGINAL E stays outside, recomputing `p = exp(x - m)` from the *final*
+// `m`. Sharing the fused copy instead would hand the divide numerators computed
+// against the running `m`, which the correction only rescales for `s`.
 // CHECK:         %[[POUT:.+]] = linalg.generic
 // CHECK-SAME:        ins(%[[X]], %[[LOOP]]#0 : tensor<64x512xf32>, tensor<64xf32>)
 // CHECK:           arith.subf
@@ -667,4 +669,135 @@ func.func @neg_r2_input_not_reduced(%arg0: tensor<64x512xf32>, %v: tensor<128xf3
     linalg.yield %acc : f32
   } -> tensor<64x128xf32>
   return %5 : tensor<64x128xf32>
+}
+
+// -----
+
+#map = affine_map<(d0, d1) -> (d0, d1)>
+#map1 = affine_map<(d0, d1) -> (d0)>
+
+// A variance-shaped term `E = (x - m)^2`. Every other condition holds -- R1 is a
+// tiled max, R2 is a zero-initialized sum -- but `E` is not multiplicatively
+// separable in `m`: `x - m` carries only an additive dependence and there is no
+// `exp` to convert it, so the `mulf` has no factorization to preserve. No
+// per-slice scalar can rescale a stale accumulator here, so the chain is
+// rejected rather than silently miscompiled.
+
+// CHECK-LABEL: func.func @neg_e_not_separable_variance
+// The loop is unchanged: it carries a single accumulator and holds only R1.
+// CHECK:         scf.for %{{.+}} = %{{.+}} to %{{.+}} step %{{.+}} iter_args(%{{.+}} = %{{.+}}) -> (tensor<64xf32>) {
+// CHECK:           linalg.generic
+// CHECK:             arith.maximumf
+// CHECK-NOT:       linalg.generic
+// CHECK:         }
+// E and R2 remain outside the loop.
+// CHECK:         linalg.generic
+// CHECK:           arith.subf
+// CHECK:           arith.mulf
+func.func @neg_e_not_separable_variance(%arg0: tensor<64x512xf32>, %argd: tensor<64x512xf32>) -> tensor<64xf32> {
+  %cst = arith.constant 0.000000e+00 : f32
+  %cstn = arith.constant 0xFF800000 : f32
+  %c0 = arith.constant 0 : index
+  %c512 = arith.constant 512 : index
+  %c32 = arith.constant 32 : index
+  %0 = tensor.empty() : tensor<64xf32>
+  %1 = linalg.fill ins(%cstn : f32) outs(%0 : tensor<64xf32>) -> tensor<64xf32>
+  %2 = scf.for %a = %c0 to %c512 step %c32 iter_args(%b = %1) -> (tensor<64xf32>) {
+    %es = tensor.extract_slice %arg0[0, %a] [64, 32] [1, 1] : tensor<64x512xf32> to tensor<64x32xf32>
+    %es1 = tensor.extract_slice %b[0] [64] [1] : tensor<64xf32> to tensor<64xf32>
+    %m = linalg.generic {indexing_maps = [#map, #map1], iterator_types = ["parallel", "reduction"]} ins(%es : tensor<64x32xf32>) outs(%es1 : tensor<64xf32>) {
+    ^bb0(%in: f32, %out: f32):
+      %v = arith.maximumf %in, %out : f32
+      linalg.yield %v : f32
+    } -> tensor<64xf32>
+    %ins = tensor.insert_slice %m into %b[0] [64] [1] : tensor<64xf32> into tensor<64xf32>
+    scf.yield %ins : tensor<64xf32>
+  } {__reduction_loop__}
+  %3 = linalg.generic {indexing_maps = [#map, #map1, #map], iterator_types = ["parallel", "parallel"]} ins(%arg0, %2 : tensor<64x512xf32>, tensor<64xf32>) outs(%argd : tensor<64x512xf32>) {
+  ^bb0(%in: f32, %mv: f32, %out: f32):
+    %d = arith.subf %in, %mv : f32
+    %v = arith.mulf %d, %d : f32
+    linalg.yield %v : f32
+  } -> tensor<64x512xf32>
+  %4 = linalg.fill ins(%cst : f32) outs(%0 : tensor<64xf32>) -> tensor<64xf32>
+  %5 = linalg.generic {indexing_maps = [#map, #map1], iterator_types = ["parallel", "reduction"]} ins(%3 : tensor<64x512xf32>) outs(%4 : tensor<64xf32>) {
+  ^bb0(%in: f32, %out: f32):
+    %v = arith.addf %in, %out : f32
+    linalg.yield %v : f32
+  } -> tensor<64xf32>
+  return %5 : tensor<64xf32>
+}
+
+// -----
+
+#map = affine_map<(d0, d1) -> (d0, d1)>
+#map1 = affine_map<(d0, d1) -> (d0)>
+
+// An L1-norm term `E = abs(x / m)` reaches multiplicative separability without
+// passing through an `exp`: the `divf` gives `g(m) = 1/m` directly and `absf`
+// preserves it, since `|g * h| = |g| * |h|`. The correction is therefore
+// `|1/m_new| / |1/m_old|`.
+
+// CHECK-LABEL: func.func @e_separable_abs_of_divide
+// CHECK-DAG:     %[[ONE:.+]] = arith.constant 1.000000e+00 : f32
+// The loop carries `m`, the fused E clone's full result and `s`.
+// CHECK:         scf.for %[[IV:[a-zA-Z0-9_]+]] =
+// CHECK-SAME:        -> (tensor<64xf32>, tensor<64x512xf32>, tensor<64xf32>)
+// R1's DPS init holds the previous running `m`; the "old" term reads it.
+// CHECK:           %[[MOLD:.+]] = tensor.extract_slice %{{.+}}[0] [64] [1]
+// CHECK:           %[[M:.+]] = linalg.generic
+// CHECK:             arith.maximumf
+// E's clone is fused and re-sliced to the tile.
+// CHECK:           %[[E:.+]] = linalg.generic
+// CHECK:             arith.divf
+// CHECK:             math.absf
+// CHECK:           } -> tensor<64x32xf32>
+// The factor is `|1/m_new| / |1/m_old|`: the data operand is neutralized to 1.0
+// at the `divf` consuming it, and `absf` carries the accumulator factor through.
+// CHECK:           %[[TERMNEW:.+]] = linalg.generic
+// CHECK-SAME:          ins(%[[M]] : tensor<64xf32>)
+// CHECK:             arith.divf %[[ONE]]
+// CHECK:             math.absf
+// CHECK:           %[[TERMOLD:.+]] = linalg.generic
+// CHECK-SAME:          ins(%[[MOLD]] : tensor<64xf32>)
+// CHECK:             arith.divf %[[ONE]]
+// CHECK:             math.absf
+// CHECK:           %[[FACTOR:.+]] = linalg.elementwise kind=#linalg.elementwise_kind<div> ins(%[[TERMNEW]], %[[TERMOLD]] : tensor<64xf32>, tensor<64xf32>)
+// CHECK:           %[[SCALED:.+]] = linalg.elementwise kind=#linalg.elementwise_kind<mul> ins(%{{.+}}, %[[FACTOR]] : tensor<64xf32>, tensor<64xf32>)
+// CHECK:           linalg.generic
+// CHECK-SAME:          ins(%[[E]] : tensor<64x32xf32>)
+// CHECK-SAME:          outs(%[[SCALED]] : tensor<64xf32>)
+// CHECK:             arith.addf
+func.func @e_separable_abs_of_divide(%arg0: tensor<64x512xf32>, %argd: tensor<64x512xf32>) -> tensor<64xf32> {
+  %cst = arith.constant 0.000000e+00 : f32
+  %c0 = arith.constant 0 : index
+  %c512 = arith.constant 512 : index
+  %c32 = arith.constant 32 : index
+  %0 = tensor.empty() : tensor<64xf32>
+  %1 = linalg.fill ins(%cst : f32) outs(%0 : tensor<64xf32>) -> tensor<64xf32>
+  %2 = scf.for %a = %c0 to %c512 step %c32 iter_args(%b = %1) -> (tensor<64xf32>) {
+    %es = tensor.extract_slice %arg0[0, %a] [64, 32] [1, 1] : tensor<64x512xf32> to tensor<64x32xf32>
+    %es1 = tensor.extract_slice %b[0] [64] [1] : tensor<64xf32> to tensor<64xf32>
+    %m = linalg.generic {indexing_maps = [#map, #map1], iterator_types = ["parallel", "reduction"]} ins(%es : tensor<64x32xf32>) outs(%es1 : tensor<64xf32>) {
+    ^bb0(%in: f32, %out: f32):
+      %av = math.absf %in : f32
+      %v = arith.maximumf %av, %out : f32
+      linalg.yield %v : f32
+    } -> tensor<64xf32>
+    %ins = tensor.insert_slice %m into %b[0] [64] [1] : tensor<64xf32> into tensor<64xf32>
+    scf.yield %ins : tensor<64xf32>
+  } {__reduction_loop__}
+  %3 = linalg.generic {indexing_maps = [#map, #map1, #map], iterator_types = ["parallel", "parallel"]} ins(%arg0, %2 : tensor<64x512xf32>, tensor<64xf32>) outs(%argd : tensor<64x512xf32>) {
+  ^bb0(%in: f32, %mv: f32, %out: f32):
+    %d = arith.divf %in, %mv : f32
+    %v = math.absf %d : f32
+    linalg.yield %v : f32
+  } -> tensor<64x512xf32>
+  %4 = linalg.fill ins(%cst : f32) outs(%0 : tensor<64xf32>) -> tensor<64xf32>
+  %5 = linalg.generic {indexing_maps = [#map, #map1], iterator_types = ["parallel", "reduction"]} ins(%3 : tensor<64x512xf32>) outs(%4 : tensor<64xf32>) {
+  ^bb0(%in: f32, %out: f32):
+    %v = arith.addf %in, %out : f32
+    linalg.yield %v : f32
+  } -> tensor<64xf32>
+  return %5 : tensor<64xf32>
 }
