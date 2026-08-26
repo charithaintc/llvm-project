@@ -570,6 +570,83 @@ def FuseIntoContainingOp :
 }
 
 //===----------------------------------------------------------------------===//
+// FuseDependantReductionOpsOp
+//===----------------------------------------------------------------------===//
+
+def FuseDependantReductionOpsOp :
+    Op<Transform_Dialect, "structured.fuse_dependant_reduction_ops",
+      [DeclareOpInterfaceMethods<TransformOpInterface>,
+       DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
+       ReportTrackingListenerFailuresOpTrait]> {
+  let summary = "Fuse a dependent elementwise + consumer reduction into an "
+                "already-tiled producer reduction loop.";
+
+  let description = [{
+    Fuses a dependency chain `R1 -> E -> R2` into a single online (one-pass)
+    reduction loop, where:
+
+    - `R1` is the producer reduction (`tiled_reduction_loop`),
+    - `E` is an elementwise op (`elementwise_op`) that consumes `R1`'s result
+      as a broadcast input, and
+    - `R2` is the consumer reduction (`reduction_op`) that reduces `E`'s output
+      over the same axis as `R1`.
+
+    `E` is kept as a separate op rather than folded into `R2`'s body: since it
+    is exactly the per-element term `R2` reduces, the correction factor can be
+    derived from `E` alone, by evaluating it with its data inputs set to their
+    neutral element and the consumed accumulators bound to their new and old
+    values. `R2`'s body is never inspected.
+
+    `R1` must already be tiled along the shared reduction dimension into an
+    `scf.for` annotated with the `__reduction_loop__` unit attribute; the tile
+    size is that loop's step. This op does not tile `R1` -- use
+    `transform.structured.tile_using_for` plus `transform.annotate`.
+
+    `E` and `R2` are cloned into the loop, their reduction-dim slices cut to the
+    tile extent, and a correction is inserted that rescales the running
+    accumulator whenever a consumed accumulator changes across a tile. Any
+    `E`/`R2` destination operand left below the loop by tiling is hoisted first.
+
+    If `E` feeds consumers besides `R2`, a **clone** of `E` is fused and the
+    original left in place. The fused copy computes each tile against the
+    running accumulator, which the correction only repairs for `R2`, so `E`'s
+    own full-extent result is stale in all but the last tile and must not be
+    read off the loop -- softmax's normalizing divide, for instance, needs `E`
+    at the final max. The original still reads `R1`'s final result and
+    recomputes the term correctly; the clone's full-extent loop result is dead,
+    and `--remove-dead-values` unwinds it.
+
+    A consumer that *reduces* `E` over the same axis is itself a candidate `R2`,
+    fused by applying this op again -- the clone is what leaves it a term to
+    fuse. Applying it once per consumer reduction therefore fuses an attention
+    chain (one `exp` term feeding both a row sum and a `P @ V` contraction) into
+    a single loop. Each application replaces the loop, so re-annotate the
+    returned handle with `__reduction_loop__` before the next one.
+
+    Only the chain named by the three handles is fused. (The
+    `test-linalg-dependant-reduction-fusion` pass drives the same patterns over
+    a whole function, fusing every legal chain.)
+
+    #### Return modes
+
+    Each handle must point to exactly one payload op, otherwise this produces a
+    definite failure. Produces a silenceable failure if the loop is not an
+    `scf.for`, if either op is not a `linalg.generic`, or if the triple does not
+    satisfy the legality conditions.
+
+    Returns a handle to the fused loop.
+  }];
+
+  let arguments = (ins TransformHandleTypeInterface:$tiled_reduction_loop,
+                       TransformHandleTypeInterface:$elementwise_op,
+                       TransformHandleTypeInterface:$reduction_op);
+  let results = (outs TransformHandleTypeInterface:$fused_loop);
+  let assemblyFormat = "$elementwise_op `,` $reduction_op `into` "
+                       "$tiled_reduction_loop attr-dict "
+                       " `:` functional-type(operands, results)";
+}
+
+//===----------------------------------------------------------------------===//
 // GeneralizeOp
 //===----------------------------------------------------------------------===//
 
