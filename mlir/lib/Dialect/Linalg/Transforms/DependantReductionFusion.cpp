@@ -1159,8 +1159,7 @@ static Value calculateCorrectionFactor(PatternRewriter &rewriter,
       [](AffineMap m) -> Attribute { return AffineMapAttr::get(m); });
   auto div = ElementwiseOp::create(
       rewriter, loc, ValueRange{termNew.getResult(0), termOld.getResult(0)},
-      ValueRange{init},
-      ElementwiseKindAttr::get(rewriter.getContext(), ElementwiseKind::div),
+      ValueRange{init}, ElementwiseKind::div,
       /*indexingMaps=*/rewriter.getArrayAttr(idMaps));
   return div.getResult(0);
 }
@@ -1229,10 +1228,10 @@ static LogicalResult correctFusedR2Accumulator(PatternRewriter &rewriter,
       ElementwiseOp::getDefaultIndexingMaps(/*numMaps=*/3, accType.getRank(),
                                             rewriter.getContext()),
       [](AffineMap m) -> Attribute { return AffineMapAttr::get(m); });
-  auto mul = ElementwiseOp::create(
-      rewriter, fusedR2.getLoc(), ValueRange{acc, factor}, ValueRange{acc},
-      ElementwiseKindAttr::get(rewriter.getContext(), ElementwiseKind::mul),
-      /*indexingMaps=*/rewriter.getArrayAttr(idMaps));
+  auto mul =
+      ElementwiseOp::create(rewriter, fusedR2.getLoc(), ValueRange{acc, factor},
+                            ValueRange{acc}, ElementwiseKind::mul,
+                            /*indexingMaps=*/rewriter.getArrayAttr(idMaps));
   rewriter.modifyOpInPlace(
       fusedR2, [&]() { fusedR2.getDpsInitOperand(0)->set(mul.getResult(0)); });
   return success();

@@ -90,8 +90,8 @@ func.func @softmax(%arg0: tensor<64x512xf32>) -> tensor<64xf32> {
 // CHECK:           %[[TOLD:.+]] = linalg.generic {{.*}}ins(%[[MOLD]] :
 // CHECK:             arith.subf %[[ZERO]],
 // CHECK:             math.exp
-// CHECK:           %[[F:.+]] = linalg.elementwise kind=#linalg.elementwise_kind<div> ins(%[[TNEW]], %[[TOLD]] : tensor<64xf32>, tensor<64xf32>)
-// CHECK:           %[[SCALED:.+]] = linalg.elementwise kind=#linalg.elementwise_kind<mul> ins(%[[SOLD]], %[[F]] : tensor<64xf32>, tensor<64xf32>)
+// CHECK:           %[[F:.+]] = linalg.elementwise <div> ins(%[[TNEW]], %[[TOLD]] : tensor<64xf32>, tensor<64xf32>)
+// CHECK:           %[[SCALED:.+]] = linalg.elementwise <mul> ins(%[[SOLD]], %[[F]] : tensor<64xf32>, tensor<64xf32>)
 
 // The fused R2 accumulates this tile's terms into the rescaled running sum.
 // CHECK:           %[[SNEW:.+]] = linalg.generic
@@ -313,15 +313,15 @@ func.func @one_elementwise_term_two_consumer_reductions(
 
 // Each fused consumer reduction gets its own online correction, built over its
 // own accumulator shape: [64] for the row sum, [64x128] for the contraction.
-// CHECK:           %[[F1:.+]] = linalg.elementwise kind=#linalg.elementwise_kind<div> ins(%{{.+}}, %{{.+}} : tensor<64xf32>, tensor<64xf32>)
-// CHECK:           %[[L_SCALED:.+]] = linalg.elementwise kind=#linalg.elementwise_kind<mul> ins(%{{.+}}, %[[F1]] : tensor<64xf32>, tensor<64xf32>)
+// CHECK:           %[[F1:.+]] = linalg.elementwise <div> ins(%{{.+}}, %{{.+}} : tensor<64xf32>, tensor<64xf32>)
+// CHECK:           %[[L_SCALED:.+]] = linalg.elementwise <mul> ins(%{{.+}}, %[[F1]] : tensor<64xf32>, tensor<64xf32>)
 // CHECK:           %[[L:.+]] = linalg.generic
 // CHECK-SAME:          ins(%[[E1]] : tensor<64x32xf32>)
 // CHECK-SAME:          outs(%[[L_SCALED]] : tensor<64xf32>)
 // CHECK:             arith.addf
 // CHECK:           %[[VTILE:.+]] = tensor.extract_slice %[[V]][%[[IV]], 0] [32, 128] [1, 1]
-// CHECK:           %[[F2:.+]] = linalg.elementwise kind=#linalg.elementwise_kind<div> ins(%{{.+}}, %{{.+}} : tensor<64x128xf32>, tensor<64x128xf32>)
-// CHECK:           %[[O_SCALED:.+]] = linalg.elementwise kind=#linalg.elementwise_kind<mul> ins(%{{.+}}, %[[F2]] : tensor<64x128xf32>, tensor<64x128xf32>)
+// CHECK:           %[[F2:.+]] = linalg.elementwise <div> ins(%{{.+}}, %{{.+}} : tensor<64x128xf32>, tensor<64x128xf32>)
+// CHECK:           %[[O_SCALED:.+]] = linalg.elementwise <mul> ins(%{{.+}}, %[[F2]] : tensor<64x128xf32>, tensor<64x128xf32>)
 // CHECK:           %[[O:.+]] = linalg.generic
 // CHECK-SAME:          ins(%[[E2]], %[[VTILE]] : tensor<64x32xf32>, tensor<32x128xf32>)
 // CHECK-SAME:          outs(%[[O_SCALED]] : tensor<64x128xf32>)
@@ -436,8 +436,8 @@ func.func @only_the_handled_chain_is_fused(%arg0: tensor<64x512xf32>, %arg1: ten
 // CHECK-SAME:        -> (tensor<64xf32>, tensor<64x512xf32>, tensor<64xf32>)
 // CHECK:           arith.maximumf
 // CHECK:           math.exp
-// CHECK:           linalg.elementwise kind=#linalg.elementwise_kind<div>
-// CHECK:           linalg.elementwise kind=#linalg.elementwise_kind<mul>
+// CHECK:           linalg.elementwise <div>
+// CHECK:           linalg.elementwise <mul>
 // CHECK:           arith.addf
 // CHECK:         } {fused_reduction_loop}
 
@@ -595,8 +595,8 @@ func.func @r2_input_defined_below_the_loop(%arg0: tensor<64x512xf32>, %v: tensor
 // CHECK:           arith.maximumf
 // CHECK:           math.exp
 // CHECK:           tensor.extract_slice %[[VS]][%[[IV]], 0] [32, 128] [1, 1]
-// CHECK:           linalg.elementwise kind=#linalg.elementwise_kind<div>
-// CHECK:           linalg.elementwise kind=#linalg.elementwise_kind<mul>
+// CHECK:           linalg.elementwise <div>
+// CHECK:           linalg.elementwise <mul>
 // CHECK:           linalg.generic
 // CHECK:             arith.mulf
 // CHECK:             arith.addf

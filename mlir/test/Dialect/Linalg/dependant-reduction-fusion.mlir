@@ -50,8 +50,8 @@
 // CHECK:           %[[TERMOLD:.+]] = linalg.generic
 // CHECK-SAME:          ins(%[[MOLD]] : tensor<64xf32>)
 // CHECK:             math.exp
-// CHECK:           %[[FACTOR:.+]] = linalg.elementwise kind=#linalg.elementwise_kind<div> ins(%[[TERMNEW]], %[[TERMOLD]] : tensor<64xf32>, tensor<64xf32>)
-// CHECK:           %[[SCALED:.+]] = linalg.elementwise kind=#linalg.elementwise_kind<mul> ins(%[[SSLICE]], %[[FACTOR]] : tensor<64xf32>, tensor<64xf32>)
+// CHECK:           %[[FACTOR:.+]] = linalg.elementwise <div> ins(%[[TERMNEW]], %[[TERMOLD]] : tensor<64xf32>, tensor<64xf32>)
+// CHECK:           %[[SCALED:.+]] = linalg.elementwise <mul> ins(%[[SSLICE]], %[[FACTOR]] : tensor<64xf32>, tensor<64xf32>)
 // CHECK:           %[[S:.+]] = linalg.generic
 // CHECK-SAME:          ins(%[[E]] : tensor<64x32xf32>)
 // CHECK-SAME:          outs(%[[SCALED]] : tensor<64xf32>)
@@ -151,8 +151,8 @@ func.func @softmax(%arg0: memref<64x512xf32>, %arg1: memref<64x512xf32>) {
 // CHECK:           %[[TERMOLD:.+]] = linalg.generic
 // CHECK-SAME:          ins(%[[MOLD]] : tensor<64xf32>)
 // CHECK:             math.exp
-// CHECK:           %[[FACTOR:.+]] = linalg.elementwise kind=#linalg.elementwise_kind<div> ins(%[[TERMNEW]], %[[TERMOLD]] : tensor<64xf32>, tensor<64xf32>)
-// CHECK:           %[[SCALED:.+]] = linalg.elementwise kind=#linalg.elementwise_kind<mul> ins(%[[SSLICE]], %[[FACTOR]] : tensor<64xf32>, tensor<64xf32>)
+// CHECK:           %[[FACTOR:.+]] = linalg.elementwise <div> ins(%[[TERMNEW]], %[[TERMOLD]] : tensor<64xf32>, tensor<64xf32>)
+// CHECK:           %[[SCALED:.+]] = linalg.elementwise <mul> ins(%[[SSLICE]], %[[FACTOR]] : tensor<64xf32>, tensor<64xf32>)
 // CHECK:           %[[R2:.+]] = linalg.generic
 // CHECK-SAME:          ins(%[[E]], %[[XTILE2]] : tensor<64x32xf32>, tensor<64x32xf32>)
 // CHECK-SAME:          outs(%[[SCALED]] : tensor<64xf32>)
@@ -573,8 +573,8 @@ func.func @neg_loop_not_annotated(%arg0: tensor<64x512xf32>, %argd: tensor<64x51
 // CHECK-SAME:          ins(%[[MOLD]] : tensor<64xf32>)
 // CHECK-SAME:          outs(%{{.+}} : tensor<64x128xf32>)
 // CHECK:             math.exp
-// CHECK:           %[[FACTOR:.+]] = linalg.elementwise kind=#linalg.elementwise_kind<div> ins(%[[TERMNEW]], %[[TERMOLD]] : tensor<64x128xf32>, tensor<64x128xf32>)
-// CHECK:           %[[SCALED:.+]] = linalg.elementwise kind=#linalg.elementwise_kind<mul> ins(%[[ACCSLICE]], %[[FACTOR]] : tensor<64x128xf32>, tensor<64x128xf32>)
+// CHECK:           %[[FACTOR:.+]] = linalg.elementwise <div> ins(%[[TERMNEW]], %[[TERMOLD]] : tensor<64x128xf32>, tensor<64x128xf32>)
+// CHECK:           %[[SCALED:.+]] = linalg.elementwise <mul> ins(%[[ACCSLICE]], %[[FACTOR]] : tensor<64x128xf32>, tensor<64x128xf32>)
 // CHECK:           %[[ACC:.+]] = linalg.generic
 // CHECK-SAME:          ins(%[[E]], %[[VSLICE]] : tensor<64x32xf32>, tensor<32x128xf32>)
 // CHECK-SAME:          outs(%[[SCALED]] : tensor<64x128xf32>)
@@ -762,8 +762,8 @@ func.func @neg_e_not_separable_variance(%arg0: tensor<64x512xf32>, %argd: tensor
 // CHECK-SAME:          ins(%[[MOLD]] : tensor<64xf32>)
 // CHECK:             arith.divf %[[ONE]]
 // CHECK:             math.absf
-// CHECK:           %[[FACTOR:.+]] = linalg.elementwise kind=#linalg.elementwise_kind<div> ins(%[[TERMNEW]], %[[TERMOLD]] : tensor<64xf32>, tensor<64xf32>)
-// CHECK:           %[[SCALED:.+]] = linalg.elementwise kind=#linalg.elementwise_kind<mul> ins(%{{.+}}, %[[FACTOR]] : tensor<64xf32>, tensor<64xf32>)
+// CHECK:           %[[FACTOR:.+]] = linalg.elementwise <div> ins(%[[TERMNEW]], %[[TERMOLD]] : tensor<64xf32>, tensor<64xf32>)
+// CHECK:           %[[SCALED:.+]] = linalg.elementwise <mul> ins(%{{.+}}, %[[FACTOR]] : tensor<64xf32>, tensor<64xf32>)
 // CHECK:           linalg.generic
 // CHECK-SAME:          ins(%[[E]] : tensor<64x32xf32>)
 // CHECK-SAME:          outs(%[[SCALED]] : tensor<64xf32>)
