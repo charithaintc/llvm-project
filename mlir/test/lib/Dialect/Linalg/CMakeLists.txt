@@ -1,6 +1,7 @@
 # Exclude tests from libMLIR.so
 add_mlir_library(MLIRLinalgTestPasses
   TestLinalgDecomposeOps.cpp
+  TestLinalgDependantReductionFusion.cpp
   TestLinalgDropUnitDims.cpp
   TestLinalgElementwiseFusion.cpp
   TestLinalgFusionTransforms.cpp
