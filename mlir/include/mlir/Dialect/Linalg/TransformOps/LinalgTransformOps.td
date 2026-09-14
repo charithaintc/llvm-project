@@ -616,10 +616,22 @@ def FuseDependantReductionOpsOp :
     size is that loop's step. This op does not tile `R1` -- use
     `transform.structured.tile_using_for` plus `transform.annotate`.
 
+    The loop's bounds may be dynamic. What is required is that its trip extent
+    (`ub - lb`) be *provably* equal to the reduction extent of `E` and `R2`,
+    which is established with value bounds rather than by comparing static
+    sizes; a reduction axis of dynamic length is therefore supported, and a
+    chain whose extents cannot be related is rejected rather than guessed at.
+
     `E` and `R2` are cloned into the loop, their reduction-dim slices cut to the
     tile extent, and a correction is inserted that rescales the running
     accumulator whenever a consumed accumulator changes across a tile. Any
     `E`/`R2` destination operand left below the loop by tiling is hoisted first.
+    When the step is not known to divide the reduction extent evenly -- always
+    the case for a dynamic extent -- the slices are cut to
+    `min(step, ub - iv)` so the last tile is partial, reusing the `affine.min`
+    that tiling `R1` already emitted. The correction is unaffected: it rescales
+    a per-parallel-slice accumulator, which does not depend on how wide the tile
+    is along the reduction axis.
 
     If `E` feeds consumers besides `R2`, a **clone** of `E` is fused and the
     original left in place. The fused copy computes each tile against the

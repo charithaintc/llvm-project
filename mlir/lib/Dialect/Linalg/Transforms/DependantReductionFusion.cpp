@@ -21,6 +21,12 @@
 // R2's running accumulator is rescaled per tile by a correction factor derived
 // from `E`.
 //
+// The reduction axis may be of dynamic length: legality only needs the loop's
+// trip extent to be *provably* equal to `E`'s and `R2`'s reduction extent (see
+// `loopExtentEqualsDimExtent`), and the tile is clamped to `min(step, ub - iv)`
+// whenever the step is not known to divide that extent (see
+// `getBoundedReductionTileSize`).
+//
 // When `E` feeds any consumer besides `R2` the fusion works on a clone of `E`
 // and leaves the original in place: the fused copy computes each tile against
 // the *running* accumulator, which only the online correction on `R2` accounts
@@ -42,6 +48,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "mlir/Analysis/SliceAnalysis.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
@@ -57,6 +64,7 @@
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/TypeUtilities.h"
+#include "mlir/Interfaces/ValueBoundsOpInterface.h"
 #include "mlir/Transforms/RegionUtils.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
@@ -339,6 +347,50 @@ findElementwiseDimForR2ReductionDim(linalg::GenericOp e, linalg::GenericOp r2,
   return std::nullopt;
 }
 
+/// Whether `loop`'s trip extent (`ub - lb`) is provably equal to the extent of
+/// `op`'s loop dim `dim`.
+///
+/// The two extents are usually *different* SSA values denoting the same
+/// quantity — after tiling a dynamic axis, the loop bound is one `tensor.dim`
+/// of the reduced tensor while `E`/`R2` reach the same size through their own
+/// operands — so a structural comparison is too weak and value bounds does the
+/// reasoning. It resolves a `DestinationStyleOpInterface` result dim to the
+/// matching init dim, which is what links `R2`'s reduction extent back through
+/// `E`'s result to the tensor the loop bound came from.
+///
+/// `dim`'s extent is read off an operand dimension that `dim` indexes directly.
+/// Every such dimension has the same extent — that is what makes them a single
+/// `linalg` iterator — so *any* of them settles the question, and all are tried
+/// because value bounds may only be able to relate some of them to the loop
+/// bound. (`LinalgOp::createLoopRanges` would give the extent directly but
+/// materializes IR to do it, and a legality check must stay side-effect free.)
+static bool loopExtentEqualsDimExtent(scf::ForOp loop, linalg::GenericOp op,
+                                      unsigned dim) {
+  AffineExpr s0, s1;
+  bindSymbols(loop.getContext(), s0, s1);
+  ValueBoundsConstraintSet::Variable tripExtent(
+      AffineMap::get(/*dimCount=*/0, /*symbolCount=*/2, {s0 - s1},
+                     loop.getContext()),
+      ArrayRef<ValueBoundsConstraintSet::Variable>{
+          ValueBoundsConstraintSet::Variable(loop.getUpperBound()),
+          ValueBoundsConstraintSet::Variable(loop.getLowerBound())});
+
+  for (OpOperand &operand : op->getOpOperands()) {
+    AffineMap map = op.getMatchingIndexingMap(&operand);
+    for (auto [pos, expr] : llvm::enumerate(map.getResults())) {
+      auto dimExpr = dyn_cast<AffineDimExpr>(expr);
+      if (!dimExpr || dimExpr.getPosition() != dim)
+        continue;
+      FailureOr<bool> equal = ValueBoundsConstraintSet::areEqual(
+          tripExtent, ValueBoundsConstraintSet::Variable(
+                          operand.get(), static_cast<int64_t>(pos)));
+      if (succeeded(equal) && *equal)
+        return true;
+    }
+  }
+  return false;
+}
+
 /// Whether this fusion must work on a *clone* of `e` rather than on `e` itself,
 /// i.e. whether `e`'s result feeds any consumer besides `r2`.
 ///
@@ -544,7 +596,8 @@ checkElementwiseSeparability(linalg::GenericOp e,
 /// non-reduction results), as built by `mapLoopResultsToInnerReductions`. Each
 /// inner reduction reduces only one tile and reads `tensor.extract_slice`s of
 /// the real inputs. The loop's `step` is the tile size and `ub - lb` is the
-/// full reduction extent.
+/// full reduction extent; the bounds may be dynamic, so long as that extent is
+/// *provably* equal to the reduction extent of `E` and `R2`.
 ///
 /// The chain is `R1 -> E -> R2` with the elementwise term UNFUSED:
 ///   * `E` is all-parallel, consumes one or more R1 loop results plus the data
@@ -673,55 +726,31 @@ static LogicalResult checkLegalFusionTriple(
     return failure();
   eTiledDim = *eRedDim;
 
-  // The producer reduction loop must have static, constant bounds: the tile
-  // size is the loop `step` and the full reduction extent is `ub - lb`. That
-  // extent must equal R2's (static) reduction extent, and the tile size must
-  // evenly divide it.
-  std::optional<int64_t> lb = getConstantIntValue(r1Loop.getLowerBound());
-  std::optional<int64_t> ub = getConstantIntValue(r1Loop.getUpperBound());
+  // The tile size is the producer loop's `step`, which must be a constant so
+  // that the retiling step can tell whether it divides the reduction extent
+  // evenly. The bounds themselves need not be constant.
   std::optional<int64_t> step = getConstantIntValue(r1Loop.getStep());
-  if (!lb || !ub || !step || *step <= 0) {
-    LLVM_DEBUG(
-        DBGS() << "checkLegalFusionTriple: failed — R1 reduction loop does "
-                  "not have constant, positive bounds/step.\n");
-    return failure();
-  }
-  int64_t fullExtent = *ub - *lb;
-  int64_t tileSize = *step;
-  SmallVector<int64_t> ranges2 = r2.getStaticLoopRanges();
-  int64_t r2RedRange = ranges2[r2RedDims.front()];
-  if (ShapedType::isDynamic(r2RedRange)) {
-    LLVM_DEBUG(
-        DBGS() << "checkLegalFusionTriple: failed — R2 reduction range is "
-                  "dynamic; fusion requires a static reduction "
-                  "extent.\n");
-    return failure();
-  }
-  if (r2RedRange != fullExtent) {
-    LLVM_DEBUG(
-        DBGS() << "checkLegalFusionTriple: failed — R2's reduction extent ("
-               << r2RedRange << ") differs from the R1 loop extent ("
-               << fullExtent << ").\n");
-    return failure();
-  }
-  if (fullExtent % tileSize != 0) {
-    LLVM_DEBUG(DBGS() << "checkLegalFusionTriple: failed — tile size "
-                      << tileSize
-                      << " does not evenly divide the reduction extent "
-                      << fullExtent << ".\n");
+  if (!step || *step <= 0) {
+    LLVM_DEBUG(DBGS() << "checkLegalFusionTriple: failed — R1 reduction loop "
+                         "does not have a constant, positive step.\n");
     return failure();
   }
 
-  // (E4) E's extent along the axis carrying R2's reduction must match the R1
-  // loop extent too, so that re-slicing E to the tile is well defined.
-  SmallVector<int64_t> rangesE = e.getStaticLoopRanges();
-  int64_t eRedRange = rangesE[*eRedDim];
-  if (ShapedType::isDynamic(eRedRange) || eRedRange != fullExtent) {
-    LLVM_DEBUG(
-        DBGS() << "checkLegalFusionTriple: failed — E's extent along the "
-                  "axis carrying R2's reduction ("
-               << eRedRange << ") differs from the R1 loop extent ("
-               << fullExtent << ").\n");
+  // The loop's trip extent (`ub - lb`) must equal R2's reduction extent, and
+  // (E4) E's extent along the axis carrying that reduction, so that re-slicing
+  // both to the current tile is well defined. The extents need only be
+  // *provably* equal, not statically known, which is what admits a reduction
+  // axis of dynamic length.
+  if (!loopExtentEqualsDimExtent(r1Loop, r2, r2RedDims.front())) {
+    LLVM_DEBUG(DBGS() << "checkLegalFusionTriple: failed — R2's reduction "
+                         "extent is not provably equal to the R1 loop "
+                         "extent.\n");
+    return failure();
+  }
+  if (!loopExtentEqualsDimExtent(r1Loop, e, *eRedDim)) {
+    LLVM_DEBUG(DBGS() << "checkLegalFusionTriple: failed — E's extent along "
+                         "the axis carrying R2's reduction is not provably "
+                         "equal to the R1 loop extent.\n");
     return failure();
   }
 
@@ -861,23 +890,84 @@ static LogicalResult checkLegalFusionTriple(
   return success();
 }
 
+/// The extent of `loop`'s current reduction tile: its `step`, clamped to
+/// `min(step, ub - iv)` when the step may not divide the trip range evenly, so
+/// that the last tile does not run past the reduction extent.
+///
+/// Mirrors `getBoundedTileSize` in SCF's TileUsingInterface.cpp, which is file
+/// static there. Emitted at the start of the loop body, reusing an equivalent
+/// `affine.min` already sitting there: having tiled `R1` along this very axis,
+/// `transform.structured.tile_using_for` computes the same clamped size for
+/// `R1`'s own slices, and sharing it keeps the fused body readable without
+/// relying on a later CSE.
+static OpFoldResult getBoundedReductionTileSize(RewriterBase &rewriter,
+                                                scf::ForOp loop) {
+  OpFoldResult lb = getAsOpFoldResult(loop.getLowerBound());
+  OpFoldResult ub = getAsOpFoldResult(loop.getUpperBound());
+  OpFoldResult step = getAsOpFoldResult(loop.getStep());
+
+  // Every tile is full when the extent is statically divisible by the step, and
+  // the tile size is then just that constant.
+  std::optional<int64_t> lbConst = getConstantIntValue(lb);
+  std::optional<int64_t> ubConst = getConstantIntValue(ub);
+  std::optional<int64_t> stepConst = getConstantIntValue(step);
+  if (lbConst && ubConst && stepConst && *stepConst > 0 &&
+      (*ubConst - *lbConst) % *stepConst == 0)
+    return step;
+
+  // Remember the op the body currently starts with: it is the only candidate
+  // for reuse, since the new `affine.min` goes in front of it and anything
+  // further down might not dominate every slice being retiled.
+  Block *body = loop.getBody();
+  Operation *firstBefore =
+      body->empty() ? nullptr : &body->getOperations().front();
+
+  // `min(ub - iv, step)`, correct for any `lb` since the IV starts there.
+  AffineExpr d0, s0, s1;
+  bindDims(rewriter.getContext(), d0);
+  bindSymbols(rewriter.getContext(), s0, s1);
+  AffineMap minMap = AffineMap::get(/*dimCount=*/1, /*symbolCount=*/2,
+                                    {s0 - d0, s1}, rewriter.getContext());
+  OpBuilder::InsertionGuard guard(rewriter);
+  rewriter.setInsertionPointToStart(body);
+  OpFoldResult tileSize = affine::makeComposedFoldedAffineMin(
+      rewriter, loop.getLoc(), minMap,
+      SmallVector<OpFoldResult>{getAsOpFoldResult(loop.getInductionVar()), ub,
+                                step});
+
+  auto tileSizeValue = dyn_cast<Value>(tileSize);
+  auto minOp = tileSizeValue
+                   ? tileSizeValue.getDefiningOp<affine::AffineMinOp>()
+                   : nullptr;
+  auto existing = dyn_cast_if_present<affine::AffineMinOp>(firstBefore);
+  if (minOp && existing && existing.getAffineMap() == minOp.getAffineMap() &&
+      existing.getOperands() == minOp.getOperands()) {
+    rewriter.eraseOp(minOp);
+    return existing.getResult();
+  }
+  return tileSize;
+}
+
 /// Rewrite `offsets`/`sizes` so that every position whose indexing-map result
 /// references `tiledDim` is cut to the current reduction tile: offset = loop
-/// IV, size = `tileSize`. Positions already cut to `tileSize` are left alone.
-/// Returns true if anything changed.
+/// IV, size = the tile extent produced by `getTileSize`. Positions already cut
+/// to that extent are left alone. `getTileSize` is only called when a position
+/// actually needs rewriting, so no tile-size IR is emitted for an operand set
+/// that is already tiled. Returns true if anything changed.
 static bool retileAlongDim(AffineMap map, unsigned tiledDim, Value iv,
-                           int64_t tileSize,
+                           function_ref<OpFoldResult()> getTileSize,
                            SmallVectorImpl<OpFoldResult> &offsets,
-                           SmallVectorImpl<OpFoldResult> &sizes, OpBuilder &b) {
+                           SmallVectorImpl<OpFoldResult> &sizes) {
   bool changed = false;
   for (auto [i, expr] : llvm::enumerate(map.getResults())) {
     auto dimExpr = dyn_cast<AffineDimExpr>(expr);
     if (!dimExpr || dimExpr.getPosition() != tiledDim)
       continue;
-    if (isConstantIntValue(sizes[i], tileSize))
+    OpFoldResult tileSize = getTileSize();
+    if (isEqualConstantIntOrValue(sizes[i], tileSize))
       continue;
     offsets[i] = iv;
-    sizes[i] = b.getIndexAttr(tileSize);
+    sizes[i] = tileSize;
     changed = true;
   }
   return changed;
@@ -900,9 +990,19 @@ static bool retileAlongDim(AffineMap map, unsigned tiledDim, Value iv,
 /// change and this reduces to an in-place slice rewrite.
 static FailureOr<linalg::GenericOp>
 retileFusedConsumerToTile(RewriterBase &rewriter, linalg::GenericOp fused,
-                          unsigned tiledDim, scf::ForOp redLoop,
-                          int64_t tileSize) {
+                          unsigned tiledDim, scf::ForOp redLoop) {
   Value iv = redLoop.getInductionVar();
+
+  // The tile extent is derived from `redLoop` rather than passed in because
+  // fusing each consumer *replaces* the loop, so the induction variable a
+  // clamped size is expressed in differs between calls. Materialized at most
+  // once, lazily, at the top of the loop body.
+  std::optional<OpFoldResult> tileSize;
+  auto getTileSize = [&]() -> OpFoldResult {
+    if (!tileSize)
+      tileSize = getBoundedReductionTileSize(rewriter, redLoop);
+    return *tileSize;
+  };
 
   // Re-slice every operand (inputs *and* inits) fed by a full-extent slice.
   bool initChanged = false;
@@ -914,7 +1014,7 @@ retileFusedConsumerToTile(RewriterBase &rewriter, linalg::GenericOp fused,
     SmallVector<OpFoldResult> offsets = sliceOp.getMixedOffsets();
     SmallVector<OpFoldResult> sizes = sliceOp.getMixedSizes();
     SmallVector<OpFoldResult> strides = sliceOp.getMixedStrides();
-    if (!retileAlongDim(map, tiledDim, iv, tileSize, offsets, sizes, rewriter))
+    if (!retileAlongDim(map, tiledDim, iv, getTileSize, offsets, sizes))
       continue;
 
     rewriter.setInsertionPoint(sliceOp);
@@ -955,7 +1055,7 @@ retileFusedConsumerToTile(RewriterBase &rewriter, linalg::GenericOp fused,
     SmallVector<OpFoldResult> sizes = insertOp.getMixedSizes();
     SmallVector<OpFoldResult> strides = insertOp.getMixedStrides();
     AffineMap outMap = fused.getMatchingIndexingMap(fused.getDpsInitOperand(0));
-    retileAlongDim(outMap, tiledDim, iv, tileSize, offsets, sizes, rewriter);
+    retileAlongDim(outMap, tiledDim, iv, getTileSize, offsets, sizes);
     rewriter.setInsertionPoint(insertOp);
     auto retiledInsert = tensor::InsertSliceOp::create(
         rewriter, insertOp.getLoc(), retiledOp.getResult(0), insertOp.getDest(),
@@ -1309,8 +1409,7 @@ static LogicalResult hoistConsumerOperandsBefore(RewriterBase &rewriter,
 static FailureOr<scf::SCFFuseConsumerOfSliceResult>
 fuseElementwiseAndR2IntoTiledR1Loop(PatternRewriter &rewriter,
                                     linalg::GenericOp e, linalg::GenericOp r2,
-                                    scf::ForOp r1Loop, unsigned eTiledDim,
-                                    int64_t tileSize) {
+                                    scf::ForOp r1Loop, unsigned eTiledDim) {
   // Fuse a clone of `E` instead of `E` itself when another consumer reduction
   // needs the term too (see `needsElementwiseClone`), leaving the original for
   // those consumers. The clone is inserted immediately *before* `E`, which
@@ -1388,7 +1487,7 @@ fuseElementwiseAndR2IntoTiledR1Loop(PatternRewriter &rewriter,
     }
     auto redLoop = cast<scf::ForOp>(loops.front().getOperation());
     FailureOr<linalg::GenericOp> retiled =
-        retileFusedConsumerToTile(rewriter, fused, tiledDim, redLoop, tileSize);
+        retileFusedConsumerToTile(rewriter, fused, tiledDim, redLoop);
     if (failed(retiled))
       return failure();
     // Retiling may rebuild the op (E's result type shrinks), so track the
@@ -1534,14 +1633,10 @@ struct FuseDependentReductionsPattern
     LLVM_DEBUG(DBGS() << "FuseDependentReductionsPattern: selected R1 loop: "
                       << *r1Loop.getOperation() << "\n");
 
-    // The tile size is the producer reduction loop's step;
-    // checkLegalFusionTriple has verified it is a constant, positive value.
-    int64_t tileSize = *getConstantIntValue(r1Loop.getStep());
-
     // Clone E and R2 into the existing tiled loop, then cut both down to the
     // current reduction tile.
     if (failed(fuseElementwiseAndR2IntoTiledR1Loop(rewriter, e, r2, r1Loop,
-                                                   eTiledDim, tileSize)))
+                                                   eTiledDim)))
       return failure();
 
     return success();

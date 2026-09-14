@@ -801,3 +801,128 @@ func.func @e_separable_abs_of_divide(%arg0: tensor<64x512xf32>, %argd: tensor<64
   } -> tensor<64xf32>
   return %5 : tensor<64xf32>
 }
+
+// -----
+
+#map = affine_map<(d0, d1) -> (d0, d1)>
+#map1 = affine_map<(d0, d1) -> (d0)>
+
+// A dynamic reduction axis. The R1 loop's bound and E/R2's reduction extent are
+// separate `tensor.dim` ops on the same tensor, so legality proves them equal
+// with value bounds rather than by comparing integers, and the tile is clamped
+// to `min(32, N - iv)` since divisibility cannot be shown.
+// CHECK-LABEL: func.func @softmax_dynamic
+// CHECK-SAME:      %[[X:[a-zA-Z0-9_]+]]: tensor<?x?xf32>
+// CHECK:         %[[LOOP:.+]]:3 = scf.for %[[IV:[a-zA-Z0-9_]+]] = %{{[a-zA-Z0-9_]+}} to %{{[a-zA-Z0-9_]+}} step %{{[a-zA-Z0-9_]+}}
+// CHECK-SAME:        -> (tensor<?xf32>, tensor<?x?xf32>, tensor<?xf32>)
+// CHECK:           %[[TS:.+]] = affine.min #{{.+}}(%[[IV]])[%{{.+}}]
+// CHECK:           linalg.generic
+// CHECK:             arith.maximumf
+// CHECK:           tensor.extract_slice %[[X]][0, %[[IV]]] [%{{.+}}, %[[TS]]] [1, 1]
+// CHECK:           %[[P:.+]] = linalg.generic
+// CHECK:             math.exp
+// CHECK:           linalg.elementwise <div>
+// CHECK:           %[[SCALED:.+]] = linalg.elementwise <mul>
+// CHECK:           linalg.generic
+// CHECK-SAME:          ins(%[[P]] : tensor<?x?xf32>)
+// CHECK-SAME:          outs(%[[SCALED]] : tensor<?xf32>)
+// CHECK:             arith.addf
+// CHECK:         }
+// CHECK:         return %[[LOOP]]#2
+func.func @softmax_dynamic(%arg0: tensor<?x?xf32>) -> tensor<?xf32> {
+  %zero = arith.constant 0.000000e+00 : f32
+  %ninf = arith.constant 0xFF800000 : f32
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c32 = arith.constant 32 : index
+  %m = tensor.dim %arg0, %c0 : tensor<?x?xf32>
+  %n = tensor.dim %arg0, %c1 : tensor<?x?xf32>
+  %rowInit = tensor.empty(%m) : tensor<?xf32>
+  %mInit = linalg.fill ins(%ninf : f32) outs(%rowInit : tensor<?xf32>) -> tensor<?xf32>
+
+  // R1: `max`, already tiled with a clamped tile so the last iteration is
+  // partial -- exactly what `tile_using_for` emits for a dynamic extent.
+  %mx = scf.for %iv = %c0 to %n step %c32 iter_args(%acc = %mInit) -> (tensor<?xf32>) {
+    %ts = affine.min affine_map<(d0)[s0] -> (-d0 + s0, 32)>(%iv)[%n]
+    %xt = tensor.extract_slice %arg0[0, %iv] [%m, %ts] [1, 1] : tensor<?x?xf32> to tensor<?x?xf32>
+    %mt = tensor.extract_slice %acc[0] [%m] [1] : tensor<?xf32> to tensor<?xf32>
+    %r = linalg.generic {indexing_maps = [#map, #map1], iterator_types = ["parallel", "reduction"]} ins(%xt : tensor<?x?xf32>) outs(%mt : tensor<?xf32>) {
+    ^bb0(%in: f32, %out: f32):
+      %v = arith.maximumf %in, %out : f32
+      linalg.yield %v : f32
+    } -> tensor<?xf32>
+    %i = tensor.insert_slice %r into %acc[0] [%m] [1] : tensor<?xf32> into tensor<?xf32>
+    scf.yield %i : tensor<?xf32>
+  } {__reduction_loop__}
+
+  %pInit = tensor.empty(%m, %n) : tensor<?x?xf32>
+  %p = linalg.generic {indexing_maps = [#map, #map1, #map], iterator_types = ["parallel", "parallel"]} ins(%arg0, %mx : tensor<?x?xf32>, tensor<?xf32>) outs(%pInit : tensor<?x?xf32>) {
+  ^bb0(%in: f32, %mv: f32, %out: f32):
+    %d = arith.subf %in, %mv : f32
+    %e = math.exp %d : f32
+    linalg.yield %e : f32
+  } -> tensor<?x?xf32>
+  %sInit = linalg.fill ins(%zero : f32) outs(%rowInit : tensor<?xf32>) -> tensor<?xf32>
+  %s = linalg.generic {indexing_maps = [#map, #map1], iterator_types = ["parallel", "reduction"]} ins(%p : tensor<?x?xf32>) outs(%sInit : tensor<?xf32>) {
+  ^bb0(%in: f32, %out: f32):
+    %a = arith.addf %in, %out : f32
+    linalg.yield %a : f32
+  } -> tensor<?xf32>
+  return %s : tensor<?xf32>
+}
+
+// -----
+
+#map = affine_map<(d0, d1) -> (d0, d1)>
+#map1 = affine_map<(d0, d1) -> (d0)>
+
+// The loop is bounded by an unrelated `index` argument rather than by a
+// dimension of the reduced tensor, so nothing ties its trip extent to E's and
+// R2's reduction extent. Value bounds cannot prove them equal, and a fusion that
+// guessed would silently drop or double-count tiles -- so the chain is rejected.
+// CHECK-LABEL: func.func @neg_extent_unprovable_dynamic
+// The loop is unchanged: it carries a single accumulator and holds only R1.
+// CHECK:         scf.for %{{.+}} = %{{.+}} to %{{.+}} step %{{.+}} iter_args(%{{.+}} = %{{.+}}) -> (tensor<?xf32>) {
+// CHECK:           linalg.generic
+// CHECK:             arith.maximumf
+// CHECK-NOT:       linalg.generic
+// CHECK:         }
+// E and R2 remain outside the loop.
+// CHECK:         linalg.generic
+func.func @neg_extent_unprovable_dynamic(%arg0: tensor<?x?xf32>, %n: index) -> tensor<?xf32> {
+  %zero = arith.constant 0.000000e+00 : f32
+  %ninf = arith.constant 0xFF800000 : f32
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c32 = arith.constant 32 : index
+  %m = tensor.dim %arg0, %c0 : tensor<?x?xf32>
+  %k = tensor.dim %arg0, %c1 : tensor<?x?xf32>
+  %rowInit = tensor.empty(%m) : tensor<?xf32>
+  %mInit = linalg.fill ins(%ninf : f32) outs(%rowInit : tensor<?xf32>) -> tensor<?xf32>
+  %mx = scf.for %iv = %c0 to %n step %c32 iter_args(%acc = %mInit) -> (tensor<?xf32>) {
+    %ts = affine.min affine_map<(d0)[s0] -> (-d0 + s0, 32)>(%iv)[%n]
+    %xt = tensor.extract_slice %arg0[0, %iv] [%m, %ts] [1, 1] : tensor<?x?xf32> to tensor<?x?xf32>
+    %mt = tensor.extract_slice %acc[0] [%m] [1] : tensor<?xf32> to tensor<?xf32>
+    %r = linalg.generic {indexing_maps = [#map, #map1], iterator_types = ["parallel", "reduction"]} ins(%xt : tensor<?x?xf32>) outs(%mt : tensor<?xf32>) {
+    ^bb0(%in: f32, %out: f32):
+      %v = arith.maximumf %in, %out : f32
+      linalg.yield %v : f32
+    } -> tensor<?xf32>
+    %i = tensor.insert_slice %r into %acc[0] [%m] [1] : tensor<?xf32> into tensor<?xf32>
+    scf.yield %i : tensor<?xf32>
+  } {__reduction_loop__}
+  %pInit = tensor.empty(%m, %k) : tensor<?x?xf32>
+  %p = linalg.generic {indexing_maps = [#map, #map1, #map], iterator_types = ["parallel", "parallel"]} ins(%arg0, %mx : tensor<?x?xf32>, tensor<?xf32>) outs(%pInit : tensor<?x?xf32>) {
+  ^bb0(%in: f32, %mv: f32, %out: f32):
+    %d = arith.subf %in, %mv : f32
+    %e = math.exp %d : f32
+    linalg.yield %e : f32
+  } -> tensor<?x?xf32>
+  %sInit = linalg.fill ins(%zero : f32) outs(%rowInit : tensor<?xf32>) -> tensor<?xf32>
+  %s = linalg.generic {indexing_maps = [#map, #map1], iterator_types = ["parallel", "reduction"]} ins(%p : tensor<?x?xf32>) outs(%sInit : tensor<?xf32>) {
+  ^bb0(%in: f32, %out: f32):
+    %a = arith.addf %in, %out : f32
+    linalg.yield %a : f32
+  } -> tensor<?xf32>
+  return %s : tensor<?xf32>
+}

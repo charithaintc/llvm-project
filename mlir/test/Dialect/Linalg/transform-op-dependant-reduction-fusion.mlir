@@ -615,3 +615,309 @@ module attributes {transform.with_named_sequence} {
     transform.yield
   }
 }
+
+// -----
+
+#map = affine_map<(d0, d1) -> (d0, d1)>
+#map1 = affine_map<(d0, d1) -> (d0)>
+
+// A softmax chain whose reduction axis has *dynamic* length. Nothing states that
+// the loop's trip extent matches E's and R2's reduction extent -- the loop bound
+// and the extents are separate `tensor.dim` ops on the same tensor -- so legality
+// proves it with value bounds instead of comparing integers. The tile size cannot
+// be shown to divide the extent, so each tile is clamped to `min(32, N - iv)`.
+// CHECK-LABEL: func.func @softmax_dynamic
+// CHECK-SAME:      %[[X:[a-zA-Z0-9_]+]]: tensor<?x?xf32>
+func.func @softmax_dynamic(%arg0: tensor<?x?xf32>) -> tensor<?xf32> {
+  %zero = arith.constant 0.000000e+00 : f32
+  %ninf = arith.constant 0xFF800000 : f32
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %m = tensor.dim %arg0, %c0 : tensor<?x?xf32>
+  %n = tensor.dim %arg0, %c1 : tensor<?x?xf32>
+  %rowInit = tensor.empty(%m) : tensor<?xf32>
+  %mInit = linalg.fill ins(%ninf : f32) outs(%rowInit : tensor<?xf32>) -> tensor<?xf32>
+
+  // R1: `max`, tiled by the schedule below rather than written out, so the loop
+  // gets the dynamic bound and clamped slices that tiling really produces.
+  %mx = linalg.generic {indexing_maps = [#map, #map1], iterator_types = ["parallel", "reduction"]} ins(%arg0 : tensor<?x?xf32>) outs(%mInit : tensor<?xf32>) {
+  ^bb0(%in: f32, %out: f32):
+    %v = arith.maximumf %in, %out : f32
+    linalg.yield %v : f32
+  } -> tensor<?xf32>
+
+  // E: the elementwise term.
+  %pInit = tensor.empty(%m, %n) : tensor<?x?xf32>
+  %p = linalg.generic {indexing_maps = [#map, #map1, #map], iterator_types = ["parallel", "parallel"]} ins(%arg0, %mx : tensor<?x?xf32>, tensor<?xf32>) outs(%pInit : tensor<?x?xf32>) {
+  ^bb0(%in: f32, %mv: f32, %out: f32):
+    %d = arith.subf %in, %mv : f32
+    %e = math.exp %d : f32
+    linalg.yield %e : f32
+  } -> tensor<?x?xf32>
+
+  // R2: `sum` over E's result.
+  %sInit = linalg.fill ins(%zero : f32) outs(%rowInit : tensor<?xf32>) -> tensor<?xf32>
+  %s = linalg.generic {indexing_maps = [#map, #map1], iterator_types = ["parallel", "reduction"]} ins(%p : tensor<?x?xf32>) outs(%sInit : tensor<?xf32>) {
+  ^bb0(%in: f32, %out: f32):
+    %a = arith.addf %in, %out : f32
+    linalg.yield %a : f32
+  } -> tensor<?xf32>
+  return %s : tensor<?xf32>
+}
+
+// CHECK-DAG:     %[[N:.+]] = tensor.dim %[[X]], %{{.+}} :
+// CHECK:         %[[LOOP:.+]]:3 = scf.for %[[IV:[a-zA-Z0-9_]+]] = %{{[a-zA-Z0-9_]+}} to %{{[a-zA-Z0-9_]+}} step %{{[a-zA-Z0-9_]+}}
+// CHECK-SAME:        -> (tensor<?xf32>, tensor<?x?xf32>, tensor<?xf32>)
+
+// The clamped tile extent, shared by R1's own slice and both fused consumers.
+// CHECK:           %[[TS:.+]] = affine.min #{{.+}}(%[[IV]])[%{{.+}}]
+// CHECK:           %[[XT:.+]] = tensor.extract_slice %[[X]][0, %[[IV]]] [%{{.+}}, %[[TS]]] [1, 1]
+// CHECK:           %[[M:.+]] = linalg.generic
+// CHECK:             arith.maximumf
+
+// The fused E is cut to the same clamped tile, destination included.
+// CHECK:           %[[EX:.+]] = tensor.extract_slice %[[X]][0, %[[IV]]] [%{{.+}}, %[[TS]]] [1, 1]
+// CHECK:           %[[EDST:.+]] = tensor.extract_slice %{{.+}}[0, %[[IV]]] [%{{.+}}, %[[TS]]] [1, 1]
+// CHECK:           %[[P:.+]] = linalg.generic
+// CHECK-SAME:          ins(%[[EX]], %[[M]] : tensor<?x?xf32>, tensor<?xf32>)
+// CHECK-SAME:          outs(%[[EDST]] : tensor<?x?xf32>)
+// CHECK:             math.exp
+
+// The online correction and the fused R2, both over the dynamic row shape.
+// CHECK:           linalg.elementwise <div> ins(%{{.+}}, %{{.+}} : tensor<?xf32>, tensor<?xf32>)
+// CHECK:           %[[SCALED:.+]] = linalg.elementwise <mul>
+// CHECK:           linalg.generic
+// CHECK-SAME:          ins(%[[P]] : tensor<?x?xf32>)
+// CHECK-SAME:          outs(%[[SCALED]] : tensor<?xf32>)
+// CHECK:             arith.addf
+// CHECK:           tensor.insert_slice %[[P]] into %{{.+}}[0, %[[IV]]] [%{{.+}}, %[[TS]]] [1, 1]
+// CHECK:         } {fused_reduction_loop}
+// CHECK:         return %[[LOOP]]#2
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%arg0: !transform.any_op) {
+    %gen = transform.structured.match ops{["linalg.generic"]} in %arg0 : (!transform.any_op) -> !transform.any_op
+    %r1, %e, %r2 = transform.split_handle %gen
+        : (!transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op)
+    %tiled, %loop = transform.structured.tile_using_for %r1 tile_sizes [0, 32]
+        : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    transform.annotate %loop "__reduction_loop__" : !transform.any_op
+    %fused = transform.structured.fuse_dependant_reduction_ops %e, %r2 into %loop
+        : (!transform.any_op, !transform.any_op, !transform.any_op) -> !transform.any_op
+    transform.annotate %fused "fused_reduction_loop" : !transform.any_op
+    transform.yield
+  }
+}
+
+// -----
+
+#map = affine_map<(d0, d1) -> (d0, d1)>
+#map1 = affine_map<(d0, d1) -> (d0)>
+#mapik = affine_map<(d0, d1, d2) -> (d0, d2)>
+#mapkj = affine_map<(d0, d1, d2) -> (d2, d1)>
+#mapij = affine_map<(d0, d1, d2) -> (d0, d1)>
+
+// The attention chain of a flash-attention kernel's per-thread body, with a
+// dynamic key sequence length: one `exp` term feeding both a row sum and a
+// `P @ V` contraction over that axis. Fused by applying the op twice, so the
+// second chain's producer is the loop the first one produced -- its bound is
+// still dynamic, so the extent proof and the clamped tile have to hold again.
+// CHECK-LABEL: func.func @attention_dynamic
+// CHECK-SAME:      %[[S:[a-zA-Z0-9_]+]]: tensor<?x?xf32>
+// CHECK-SAME:      %[[V:[a-zA-Z0-9_]+]]: tensor<?x64xf32>
+func.func @attention_dynamic(%s: tensor<?x?xf32>, %v: tensor<?x64xf32>) -> tensor<?x64xf32> {
+  %zero = arith.constant 0.000000e+00 : f32
+  %ninf = arith.constant 0xFF800000 : f32
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %m = tensor.dim %s, %c0 : tensor<?x?xf32>
+  %n = tensor.dim %s, %c1 : tensor<?x?xf32>
+  %rowInit = tensor.empty(%m) : tensor<?xf32>
+  %mInit = linalg.fill ins(%ninf : f32) outs(%rowInit : tensor<?xf32>) -> tensor<?xf32>
+
+  // R1: row max over the key axis.
+  %mx = linalg.generic {indexing_maps = [#map, #map1], iterator_types = ["parallel", "reduction"]} ins(%s : tensor<?x?xf32>) outs(%mInit : tensor<?xf32>) {
+  ^bb0(%in: f32, %out: f32):
+    %v2 = arith.maximumf %in, %out : f32
+    linalg.yield %v2 : f32
+  } -> tensor<?xf32>
+
+  // E: P = exp(S - m), read by both consumer reductions.
+  %pInit = tensor.empty(%m, %n) : tensor<?x?xf32>
+  %p = linalg.generic {indexing_maps = [#map, #map1, #map], iterator_types = ["parallel", "parallel"]} ins(%s, %mx : tensor<?x?xf32>, tensor<?xf32>) outs(%pInit : tensor<?x?xf32>) {
+  ^bb0(%in: f32, %mv: f32, %out: f32):
+    %d = arith.subf %in, %mv : f32
+    %e = math.exp %d : f32
+    linalg.yield %e : f32
+  } -> tensor<?x?xf32>
+
+  // R2a: row sum of P.
+  %lInit = linalg.fill ins(%zero : f32) outs(%rowInit : tensor<?xf32>) -> tensor<?xf32>
+  %l = linalg.generic {indexing_maps = [#map, #map1], iterator_types = ["parallel", "reduction"]} ins(%p : tensor<?x?xf32>) outs(%lInit : tensor<?xf32>) {
+  ^bb0(%in: f32, %out: f32):
+    %a = arith.addf %in, %out : f32
+    linalg.yield %a : f32
+  } -> tensor<?xf32>
+
+  // R2b: P @ V, reducing the same key axis.
+  %oInit = tensor.empty(%m) : tensor<?x64xf32>
+  %oFill = linalg.fill ins(%zero : f32) outs(%oInit : tensor<?x64xf32>) -> tensor<?x64xf32>
+  %o = linalg.generic {indexing_maps = [#mapik, #mapkj, #mapij], iterator_types = ["parallel", "parallel", "reduction"]} ins(%p, %v : tensor<?x?xf32>, tensor<?x64xf32>) outs(%oFill : tensor<?x64xf32>) {
+  ^bb0(%pv: f32, %vv: f32, %out: f32):
+    %mul = arith.mulf %pv, %vv : f32
+    %add = arith.addf %out, %mul : f32
+    linalg.yield %add : f32
+  } -> tensor<?x64xf32>
+
+  // The deferred normalization, downstream of both reductions.
+  %outInit = tensor.empty(%m) : tensor<?x64xf32>
+  %out = linalg.generic {indexing_maps = [#map, #map1, #map], iterator_types = ["parallel", "parallel"]} ins(%o, %l : tensor<?x64xf32>, tensor<?xf32>) outs(%outInit : tensor<?x64xf32>) {
+  ^bb0(%in: f32, %lv: f32, %o2: f32):
+    %d = arith.divf %in, %lv : f32
+    linalg.yield %d : f32
+  } -> tensor<?x64xf32>
+  return %out : tensor<?x64xf32>
+}
+
+// Five accumulators: the running max, one full-extent E result per fused chain,
+// the running row sum and the running contraction accumulator.
+// CHECK:         %[[LOOP:.+]]:5 = scf.for %[[IV:[a-zA-Z0-9_]+]] = %{{[a-zA-Z0-9_]+}} to %{{[a-zA-Z0-9_]+}} step %{{[a-zA-Z0-9_]+}}
+// CHECK-SAME:        -> (tensor<?xf32>, tensor<?x?xf32>, tensor<?xf32>, tensor<?x?xf32>, tensor<?x64xf32>)
+
+// One clamped tile extent for the whole body.
+// CHECK:           %[[TS:.+]] = affine.min #{{.+}}(%[[IV]])[%{{.+}}]
+// CHECK:           %[[M:.+]] = linalg.generic
+// CHECK:             arith.maximumf
+
+// Both E copies -- the clone fused for the row sum and the original fused for
+// the contraction -- read the new max over the same clamped tile.
+// CHECK:           %[[E1:.+]] = linalg.generic
+// CHECK-SAME:          ins(%{{.+}}, %[[M]] : tensor<?x?xf32>, tensor<?xf32>)
+// CHECK:             math.exp
+// CHECK:           %[[E2:.+]] = linalg.generic
+// CHECK-SAME:          ins(%{{.+}}, %[[M]] : tensor<?x?xf32>, tensor<?xf32>)
+// CHECK:             math.exp
+
+// Each consumer gets its own correction, over its own accumulator shape.
+// CHECK:           linalg.elementwise <div> ins(%{{.+}}, %{{.+}} : tensor<?xf32>, tensor<?xf32>)
+// CHECK:           %[[L_SCALED:.+]] = linalg.elementwise <mul>
+// CHECK:           linalg.generic
+// CHECK-SAME:          ins(%[[E1]] : tensor<?x?xf32>)
+// CHECK-SAME:          outs(%[[L_SCALED]] : tensor<?xf32>)
+// CHECK:             arith.addf
+
+// V is re-sliced along the reduction axis with the same clamped extent.
+// CHECK:           %[[VT:.+]] = tensor.extract_slice %[[V]][%[[IV]], 0] [%[[TS]], 64] [1, 1]
+// CHECK:           linalg.elementwise <div> ins(%{{.+}}, %{{.+}} : tensor<?x64xf32>, tensor<?x64xf32>)
+// CHECK:           %[[O_SCALED:.+]] = linalg.elementwise <mul>
+// CHECK:           linalg.generic
+// CHECK-SAME:          ins(%[[E2]], %[[VT]] : tensor<?x?xf32>, tensor<?x64xf32>)
+// CHECK-SAME:          outs(%[[O_SCALED]] : tensor<?x64xf32>)
+// CHECK:             arith.mulf
+// CHECK:             arith.addf
+// CHECK:         } {fused_reduction_loop}
+
+// Only the normalization is left outside.
+// CHECK:         linalg.generic
+// CHECK-SAME:        ins(%[[LOOP]]#4, %[[LOOP]]#2 : tensor<?x64xf32>, tensor<?xf32>)
+// CHECK:           arith.divf
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%arg0: !transform.any_op) {
+    %gen = transform.structured.match ops{["linalg.generic"]} in %arg0 : (!transform.any_op) -> !transform.any_op
+    // #1 = max (R1), #2 = E, #3 = row sum (R2a), #4 = P @ V (R2b),
+    // #5 = the normalizing divide.
+    %r1, %e, %r2a, %r2b, %div = transform.split_handle %gen
+        : (!transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op,
+                                  !transform.any_op, !transform.any_op)
+    %tiled, %loop = transform.structured.tile_using_for %r1 tile_sizes [0, 32]
+        : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    transform.annotate %loop "__reduction_loop__" : !transform.any_op
+    %fused_a = transform.structured.fuse_dependant_reduction_ops %e, %r2a into %loop
+        : (!transform.any_op, !transform.any_op, !transform.any_op) -> !transform.any_op
+    // The fused loop is the producer reduction of the second chain.
+    transform.annotate %fused_a "__reduction_loop__" : !transform.any_op
+    %e_again = transform.get_producer_of_operand %r2b[0] : (!transform.any_op) -> !transform.any_op
+    %fused_b = transform.structured.fuse_dependant_reduction_ops %e_again, %r2b into %fused_a
+        : (!transform.any_op, !transform.any_op, !transform.any_op) -> !transform.any_op
+    transform.annotate %fused_b "fused_reduction_loop" : !transform.any_op
+    transform.yield
+  }
+}
+
+// -----
+
+#map = affine_map<(d0, d1) -> (d0, d1)>
+#map1 = affine_map<(d0, d1) -> (d0)>
+
+// Fully static shapes, but a tile size that does *not* divide the reduction
+// extent (500 = 15 * 32 + 20). The extents match trivially; it is the partial
+// last tile that used to make this illegal. Clamping the tile turns the fused
+// slices dynamic even though every tensor here is static.
+// CHECK-LABEL: func.func @softmax_indivisible_static
+// CHECK-SAME:      %[[X:[a-zA-Z0-9_]+]]: tensor<64x500xf32>
+func.func @softmax_indivisible_static(%arg0: tensor<64x500xf32>) -> tensor<64xf32> {
+  %zero = arith.constant 0.000000e+00 : f32
+  %ninf = arith.constant 0xFF800000 : f32
+  %rowInit = tensor.empty() : tensor<64xf32>
+  %mInit = linalg.fill ins(%ninf : f32) outs(%rowInit : tensor<64xf32>) -> tensor<64xf32>
+  %mx = linalg.generic {indexing_maps = [#map, #map1], iterator_types = ["parallel", "reduction"]} ins(%arg0 : tensor<64x500xf32>) outs(%mInit : tensor<64xf32>) {
+  ^bb0(%in: f32, %out: f32):
+    %v = arith.maximumf %in, %out : f32
+    linalg.yield %v : f32
+  } -> tensor<64xf32>
+  %pInit = tensor.empty() : tensor<64x500xf32>
+  %p = linalg.generic {indexing_maps = [#map, #map1, #map], iterator_types = ["parallel", "parallel"]} ins(%arg0, %mx : tensor<64x500xf32>, tensor<64xf32>) outs(%pInit : tensor<64x500xf32>) {
+  ^bb0(%in: f32, %mv: f32, %out: f32):
+    %d = arith.subf %in, %mv : f32
+    %e = math.exp %d : f32
+    linalg.yield %e : f32
+  } -> tensor<64x500xf32>
+  %sInit = linalg.fill ins(%zero : f32) outs(%rowInit : tensor<64xf32>) -> tensor<64xf32>
+  %s = linalg.generic {indexing_maps = [#map, #map1], iterator_types = ["parallel", "reduction"]} ins(%p : tensor<64x500xf32>) outs(%sInit : tensor<64xf32>) {
+  ^bb0(%in: f32, %out: f32):
+    %a = arith.addf %in, %out : f32
+    linalg.yield %a : f32
+  } -> tensor<64xf32>
+  return %s : tensor<64xf32>
+}
+
+// CHECK:         %[[LOOP:.+]]:3 = scf.for %[[IV:[a-zA-Z0-9_]+]] = %{{[a-zA-Z0-9_]+}} to %{{[a-zA-Z0-9_]+}} step %{{[a-zA-Z0-9_]+}}
+// CHECK-SAME:        -> (tensor<64xf32>, tensor<64x500xf32>, tensor<64xf32>)
+// CHECK:           %[[TS:.+]] = affine.min #{{.+}}(%[[IV]])
+// CHECK:           %[[MNEW:.+]] = linalg.generic
+// CHECK:             arith.maximumf
+
+// E's tile is `[64, min(32, 500 - iv)]`, so its result type goes dynamic.
+// CHECK:           %[[EX:.+]] = tensor.extract_slice %[[X]][0, %[[IV]]] [64, %[[TS]]] [1, 1] : tensor<64x500xf32> to tensor<64x?xf32>
+// CHECK:           %[[EDST:.+]] = tensor.extract_slice %{{.+}}[0, %[[IV]]] [64, %[[TS]]] [1, 1]
+// CHECK:           %[[P:.+]] = linalg.generic
+// CHECK-SAME:          ins(%[[EX]], %[[MNEW]] : tensor<64x?xf32>, tensor<64xf32>)
+// CHECK-SAME:          outs(%[[EDST]] : tensor<64x?xf32>)
+// CHECK:             math.exp
+
+// The correction and R2 keep the static row shape; only the reduced axis moved.
+// CHECK:           linalg.elementwise <div> ins(%{{.+}}, %{{.+}} : tensor<64xf32>, tensor<64xf32>)
+// CHECK:           %[[SCALED:.+]] = linalg.elementwise <mul>
+// CHECK:           linalg.generic
+// CHECK-SAME:          ins(%[[P]] : tensor<64x?xf32>)
+// CHECK-SAME:          outs(%[[SCALED]] : tensor<64xf32>)
+// CHECK:             arith.addf
+// CHECK:           tensor.insert_slice %[[P]] into %{{.+}}[0, %[[IV]]] [64, %[[TS]]] [1, 1] : tensor<64x?xf32> into tensor<64x500xf32>
+// CHECK:         } {fused_reduction_loop}
+// CHECK:         return %[[LOOP]]#2
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%arg0: !transform.any_op) {
+    %gen = transform.structured.match ops{["linalg.generic"]} in %arg0 : (!transform.any_op) -> !transform.any_op
+    %r1, %e, %r2 = transform.split_handle %gen
+        : (!transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op)
+    %tiled, %loop = transform.structured.tile_using_for %r1 tile_sizes [0, 32]
+        : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    transform.annotate %loop "__reduction_loop__" : !transform.any_op
+    %fused = transform.structured.fuse_dependant_reduction_ops %e, %r2 into %loop
+        : (!transform.any_op, !transform.any_op, !transform.any_op) -> !transform.any_op
+    transform.annotate %fused "fused_reduction_loop" : !transform.any_op
+    transform.yield
+  }
+}
